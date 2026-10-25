@@ -1,6 +1,6 @@
 {
   "name": "gp-auto-sender-bot",
-  "version": "3.1.0",
+  "version": "3.2.0",
   "description": "Telegram GP Auto Sender Bot - MongoDB + Multi Account + Admin Panel",
   "main": "bot.js",
   "scripts": {

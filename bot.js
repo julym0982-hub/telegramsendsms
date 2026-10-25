@@ -165,6 +165,35 @@ function extractLinks(text) {
 }
 
 // ─── GRAMJS ───────────────────────────────────────────────────────────────────
+async function getProfileInfo(client) {
+  const me = await client.getMe();
+  let bio = "";
+  try {
+    const full = await client.invoke(new Api.users.GetFullUser({ id: "me" }));
+    bio = full.fullUser?.about || "";
+  } catch (_) {}
+  return {
+    name: [me.firstName, me.lastName].filter(Boolean).join(" ") || "-",
+    username: me.username ? `@${me.username}` : "-",
+    phone: me.phone ? `+${me.phone}` : "-",
+    id: me.id?.toString() || "-",
+    premium: !!me.premium,
+    bio,
+  };
+}
+
+async function getJoinedGroups(client, limit = 60) {
+  const dialogs = await client.getDialogs({ limit });
+  const out = [];
+  for (const d of dialogs) {
+    if (!(d.isGroup || d.isChannel)) continue;
+    const e = d.entity;
+    const link = e?.username ? `https://t.me/${e.username}` : null;
+    out.push({ title: d.title || e?.title || "(အမည်မရှိ)", link, members: e?.participantsCount ?? null, type: d.isChannel && !e?.megagroup ? "channel" : "group" });
+  }
+  return out;
+}
+
 async function buildClient(sessionString) {
   const client = new TelegramClient(new StringSession(sessionString), API_ID, API_HASH, { connectionRetries: 5 });
   await client.connect();
@@ -532,6 +561,7 @@ async function showAccount(ctx, acc, note) {
   if (acc.customMsg) rows.push([btn("👁 Message ကြည့်", `a:${id}:msgv`), btn("🧽 Message ဖျက်", `a:${id}:msgclr`)]);
   rows.push([btn("🤝 Join", `a:${id}:join`), btn("📤 ဒီ account ပို့", `a:${id}:send`)]);
   rows.push([btn(acc.paused ? "▶️ ပြန်စ (Resume)" : "⏸ ခဏရပ် (Pause)", `a:${id}:pause`), btn("🧪 Test (Saved Msg)", `a:${id}:test`)]);
+  rows.push([btn("👁 Profile ကြည့်", `a:${id}:prof`), btn("📂 ဝင်ပြီးသား GP များ", `a:${id}:dlg`)]);
   rows.push([btn("🔄 Reconnect", `a:${id}:rc`), btn("🔑 Session ကြည့်", `a:${id}:sess`)]);
   rows.push([btn("🗑 Account ဖျက်", `a:${id}:del`)]);
   rows.push([btn("⬅️ Accounts", "accs")]);
@@ -615,6 +645,39 @@ async function accRoute(ctx, [id, action, arg]) {
       try {
         await c.sendMessage("me", { message: pickSpun(m), parseMode: "html", linkPreview: false });
         return showAccount(ctx, acc, "🧪 Saved Messages ထဲ ပို့ပြီး — Telegram app မှာ စစ်ကြည့်ပါ");
+      } catch (e) { return showAccount(ctx, acc, `❌ ${e.message}`); }
+    }
+
+    case "prof": {
+      const c = clientPool[acc.name];
+      if (!c) return showAccount(ctx, acc, "🔴 Connected မဟုတ်ပါ — Reconnect အရင်လုပ်ပါ");
+      try {
+        const p = await getProfileInfo(c);
+        let t = `👁 [${acc.name}] Profile\n\n`;
+        t += `📛 နာမည်: ${p.name}\n`;
+        t += `🔗 Username: ${p.username}\n`;
+        t += `📱 Phone: ${p.phone}\n`;
+        t += `🆔 ID: ${p.id}\n`;
+        t += `⭐ Premium: ${p.premium ? "ဟုတ်" : "မဟုတ်"}\n`;
+        if (p.bio) t += `📝 Bio: ${p.bio}\n`;
+        return render(ctx, t, back);
+      } catch (e) { return showAccount(ctx, acc, `❌ ${e.message}`); }
+    }
+
+    case "dlg": {
+      const c = clientPool[acc.name];
+      if (!c) return showAccount(ctx, acc, "🔴 Connected မဟုတ်ပါ — Reconnect အရင်လုပ်ပါ");
+      try {
+        const groups = await getJoinedGroups(c);
+        if (!groups.length) return render(ctx, `📂 [${acc.name}] ဘာ Group/Channel မှ ဝင်မထားသေးပါ`, back);
+        let t = `📂 [${acc.name}] ဝင်ပြီးသား Group/Channel (${groups.length})\n\n`;
+        groups.forEach((g, i) => {
+          t += `${i + 1}. ${g.type === "channel" ? "📢" : "👥"} ${short(g.title, 34)}`;
+          if (g.members != null) t += ` · ${g.members}`;
+          t += `\n`;
+          if (g.link) t += `   ${g.link}\n`;
+        });
+        return render(ctx, t, back);
       } catch (e) { return showAccount(ctx, acc, `❌ ${e.message}`); }
     }
 
