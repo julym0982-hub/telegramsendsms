@@ -5,6 +5,7 @@ const { StringSession } = require("telegram/sessions");
 const { Api } = require("telegram/tl");
 const { MongoClient, ObjectId } = require("mongodb");
 const http = require("http");
+const https = require("https");
 
 // ─── CONFIG ───────────────────────────────────────────────────────────────────
 const BOT_TOKEN = process.env.BOT_TOKEN;
@@ -1208,7 +1209,8 @@ http.createServer((req, res) => { res.writeHead(200); res.end("GP Bot OK"); })
   .listen(PORT, () => console.log(`🌐 Port ${PORT}`));
 setInterval(() => {
   const url = process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`;
-  http.get(url, (r) => { r.resume(); console.log(`💓 ${r.statusCode}`); }).on("error", () => {});
+  const mod = url.startsWith("https:") ? https : http; // RENDER_EXTERNAL_URL က https ဖြစ်နိုင်လို့ module ကို URL အလိုက်ရွေး
+  mod.get(url, (r) => { r.resume(); console.log(`💓 ${r.statusCode}`); }).on("error", (e) => console.error("keepalive:", e.message));
 }, 14 * 60 * 1000);
 
 // ─── MAIN ─────────────────────────────────────────────────────────────────────
