@@ -31,6 +31,12 @@ const clientPool     = {};   // name → TelegramClient
 const entityCache    = {};   // `${name}|${link}` → entity
 let awaiting         = null; // admin ဆီက စာသားစောင့်နေတဲ့ state
 let draft            = null; // GP ထည့်ဖို့ ခဏသိမ်းထားတဲ့ links
+let stopSend         = false; // ⏹ Send ရပ်ခိုင်း flag
+let stopJoin         = false; // ⏹ Join ရပ်ခိုင်း flag
+let jitter           = true;  // delay ကို random အနည်းငယ်ပြောင်း (လူလို ပို့)
+let quietStart       = null;  // 🌙 Quiet hours (မြန်မာစံတော်ချိန်) — null = ပိတ်
+let quietEnd         = null;
+let lastFailed       = {};    // accName → [dead GP links] (နောက်ဆုံး send က)
 
 const bot = new Telegraf(BOT_TOKEN);
 
@@ -64,6 +70,50 @@ const updateLastSent = (accName, gpLink) =>
 
 // ─── HELPERS ──────────────────────────────────────────────────────────────────
 const sleep = (sec) => new Promise((r) => setTimeout(r, sec * 1000));
+// Stop နှိပ်ရင် ချက်ချင်းထွက်နိုင်တဲ့ sleep
+async function sleepStop(sec, shouldStop) {
+  const end = Date.now() + sec * 1000;
+  while (Date.now() < end) {
+    if (shouldStop()) return;
+    await new Promise((r) => setTimeout(r, Math.min(500, Math.max(1, end - Date.now()))));
+  }
+}
+const mmNow = () => new Date(Date.now() + 6.5 * 3600 * 1000); // မြန်မာစံတော်ချိန် (UTC+6:30)
+const todayKey = () => mmNow().toISOString().slice(0, 10);
+const pad2 = (n) => String(n).padStart(2, "0");
+function inQuiet() {
+  if (quietStart == null || quietEnd == null || quietStart === quietEnd) return false;
+  const h = mmNow().getUTCHours();
+  return quietStart < quietEnd ? h >= quietStart && h < quietEnd : h >= quietStart || h < quietEnd;
+}
+const quietText = () => (quietStart == null ? "🔴 ပိတ်ထား" : `🌙 ${pad2(quietStart)}:00 – ${pad2(quietEnd)}:00 (မြန်မာစံတော်ချိန်)`);
+const errCode = (e) => `${e?.errorMessage || ""} ${e?.message || ""}`;
+// ပို့လို့ ထပ်မရနိုင်တော့တဲ့ GP error တွေ
+const isPermanentErr = (e) =>
+  /CHAT_WRITE_FORBIDDEN|USER_BANNED_IN_CHANNEL|CHANNEL_PRIVATE|CHAT_ADMIN_REQUIRED|CHANNEL_INVALID|CHAT_ID_INVALID|PEER_ID_INVALID|USERNAME_NOT_OCCUPIED|USERNAME_INVALID|INVITE_HASH_EXPIRED|INVITE_HASH_INVALID|CHAT_SEND_PLAIN_FORBIDDEN|CHAT_RESTRICTED/.test(errCode(e));
+function doStop(which) {
+  const out = [];
+  if (which === "all" && schedulerTimer) {
+    stopScheduler();
+    saveSettings({ schedulerOn: false }).catch(() => {});
+    out.push("⏰ Scheduler ပိတ်ပြီး");
+  }
+  if ((which === "send" || which === "all") && isSending) { stopSend = true; out.push("⏹ Send ရပ်ခိုင်းပြီး — လက်ရှိ GP ပြီးတာနဲ့ ရပ်မယ်"); }
+  if ((which === "join" || which === "all") && isJoining) { stopJoin = true; out.push("⏹ Join ရပ်ခိုင်းပြီး — လက်ရှိ GP ပြီးတာနဲ့ ရပ်မယ်"); }
+  return out.length ? out.join("\n") : "ℹ️ ရပ်စရာ အလုပ် မရှိပါ";
+}
+const incStats = (accName, ok, fail) =>
+  (ok || fail) ? db.collection("stats").updateOne(
+    { _id: `${todayKey()}|${accName}` },
+    { $inc: { ok, fail }, $set: { day: todayKey(), accName } },
+    { upsert: true }
+  ) : null;
+async function getTodayStats() {
+  const rows = await db.collection("stats").find({ day: todayKey() }).toArray();
+  const by = {}; let ok = 0, fail = 0;
+  for (const r of rows) { by[r.accName] = r; ok += r.ok || 0; fail += r.fail || 0; }
+  return { by, ok, fail };
+}
 const clip = (t, n = 3900) => (t.length > n ? t.slice(0, n - 20) + "\n…(ဆက်ရှိသေး)" : t);
 const short = (s, n = 34) => (s.length > n ? s.slice(0, n) + "…" : s);
 const btn = (text, data) => ({ text, callback_data: data });
@@ -184,8 +234,12 @@ const isDeadSession = (e) => /AUTH_KEY|SESSION_REVOKED|SESSION_EXPIRED|USER_DEAC
 
 // ─── PROGRESS (message တစ်ခုတည်းကို edit လုပ်ပြီး အခြေအနေပြ) ─────────────────
 class Progress {
-  constructor(title) { this.title = title; this.lines = []; this.msgId = null; this.last = 0; }
+  constructor(title, stopData = null) { this.title = title; this.lines = []; this.msgId = null; this.last = 0; this.stopData = stopData; this.finished = false; this.endRows = []; }
   text() { return clip(`${this.title}\n\n${this.lines.slice(-28).join("\n")}`); }
+  markup() {
+    const rows = this.finished ? this.endRows : this.stopData ? [[btn("⏹ ရပ်မယ်", this.stopData)]] : [];
+    return { inline_keyboard: rows };
+  }
   async add(line, force = false) {
     this.lines.push(line);
     await this.flush(force);
@@ -193,17 +247,18 @@ class Progress {
   async flush(force = false) {
     try {
       if (!this.msgId) {
-        const m = await notify(this.text());
+        const m = await notify(this.text(), { reply_markup: this.markup() });
         this.msgId = m.message_id;
         this.last = Date.now();
       } else if (force || Date.now() - this.last > 2500) {
-        await bot.telegram.editMessageText(ADMIN_ID, this.msgId, undefined, this.text());
+        await bot.telegram.editMessageText(ADMIN_ID, this.msgId, undefined, this.text(), { reply_markup: this.markup() });
         this.last = Date.now();
       }
     } catch (e) {
       if (!/not modified/i.test(e.message || "")) console.error("progress:", e.message);
     }
   }
+  async finish(rows = []) { this.finished = true; this.endRows = rows; await this.flush(true); }
 }
 
 // ─── CORE SEND ────────────────────────────────────────────────────────────────
@@ -211,16 +266,21 @@ class Progress {
 async function sendAllAccounts({ force = false, onlyName = null, source = "manual" } = {}) {
   if (isSending) { await notify("⚠️ ပို့နေဆဲ ရှိသေးသည်။ ခဏစောင့်ပါ။"); return; }
   isSending = true;
+  stopSend = false;
   const title = source === "scheduler" ? "⏰ Auto send (scheduler)" : force ? "⚡ Force send" : "📤 Send (cooldown စစ်)";
-  const prog = new Progress(title);
-  let ok = 0, fail = 0, skip = 0;
+  const prog = new Progress(title, "stop:send");
+  let ok = 0, fail = 0, skip = 0, stopped = false;
+  const dead = {};
+  let endRows = [];
   try {
     const accounts = (await getAccounts()).filter((a) => !onlyName || a.name === onlyName);
-    const active = accounts.filter((a) => clientPool[a.name]);
-    if (!active.length) { await prog.add("⚠️ Connected account မရှိပါ"); return; }
-    await prog.add(`👤 Active ${active.length} | ⏱ delay ${sendDelaySeconds}s`);
+    const pausedN = accounts.filter((a) => a.paused && !onlyName).length;
+    const active = accounts.filter((a) => clientPool[a.name] && (!a.paused || onlyName));
+    if (!active.length) { await prog.add(`⚠️ ပို့လို့ရတဲ့ account မရှိပါ${pausedN ? ` (⏸ paused ${pausedN})` : ""}`); return; }
+    await prog.add(`👤 Active ${active.length}${pausedN ? ` (⏸ ${pausedN} ကျော်)` : ""} | ⏱ delay ${sendDelaySeconds}s${jitter ? " 🎲" : ""}`);
 
     for (const acc of active) {
+      if (stopSend) { stopped = true; break; }
       const client = clientPool[acc.name];
       const gpLinks = acc.gpLinks || [];
       const msg = acc.customMsg || globalMsg;
@@ -231,6 +291,7 @@ async function sendAllAccounts({ force = false, onlyName = null, source = "manua
       let aOk = 0, aFail = 0, aSkip = 0, attempted = false, minRem = 0;
 
       for (let i = 0; i < gpLinks.length; i++) {
+        if (stopSend) { stopped = true; break; }
         const link = gpLinks[i];
         if (!force) {
           const last = await getLastSent(acc.name, link);
@@ -244,7 +305,11 @@ async function sendAllAccounts({ force = false, onlyName = null, source = "manua
             }
           }
         }
-        if (attempted) await sleep(sendDelaySeconds);
+        if (attempted) {
+          const d = jitter ? Math.round(sendDelaySeconds * (0.75 + Math.random() * 0.5) * 10) / 10 : sendDelaySeconds;
+          await sleepStop(d, () => stopSend);
+          if (stopSend) { stopped = true; break; }
+        }
         attempted = true;
         try {
           await sendToGroup(acc.name, client, link, pickSpun(msg));
@@ -252,44 +317,73 @@ async function sendAllAccounts({ force = false, onlyName = null, source = "manua
           aOk++;
           await prog.add(`✅ #${i + 1} [${acc.name}]`);
         } catch (err) {
-          aFail++;
-          await prog.add(`❌ #${i + 1} [${acc.name}] ${short(err.message || "error", 80)}`);
+          const code = errCode(err);
           if (isDeadSession(err)) {
+            aFail++;
+            await prog.add(`❌ #${i + 1} [${acc.name}] ${short(err.message || "error", 80)}`);
             delete clientPool[acc.name];
             await prog.add(`🔴 [${acc.name}] session သက်တမ်းကုန်/ပိတ်ခံရ — Account ပြန်ထည့်ပါ`);
             break;
           }
-          if (err.seconds) { // FLOOD_WAIT
+          if (/FLOOD/.test(code) && err.seconds) { // FLOOD_WAIT — account တစ်ခုလုံး ခဏရပ်
+            aFail++;
+            await prog.add(`❌ #${i + 1} [${acc.name}] Flood`);
             await prog.add(`⏳ Flood wait ${err.seconds}s — [${acc.name}] ဒီအကြိမ် ရပ်လိုက်သည်`);
             break;
+          }
+          if (/SLOWMODE/.test(code)) { // GP slow mode — ဒီ GP ကိုပဲ ကျော်
+            aSkip++;
+            await prog.add(`🐢 #${i + 1} [${acc.name}] Slow mode ${err.seconds || "?"}s — ကျော်`);
+            continue;
+          }
+          aFail++;
+          await prog.add(`❌ #${i + 1} [${acc.name}] ${short(err.message || "error", 80)}`);
+          if (isPermanentErr(err)) {
+            (dead[acc.name] = dead[acc.name] || []).push(link);
+            delete entityCache[`${acc.name}|${link}`];
           }
         }
       }
       ok += aOk; fail += aFail; skip += aSkip;
-      await prog.add(`📊 [${acc.name}] ✅${aOk} ❌${aFail} ⏭${aSkip}${aSkip ? ` (နောက်ဆုံး ~${minRem}မိနစ်ကျန်)` : ""}`);
+      await incStats(acc.name, aOk, aFail).catch(() => {});
+      await prog.add(`📊 [${acc.name}] ✅${aOk} ❌${aFail} ⏭${aSkip}${aSkip && minRem ? ` (နောက်ဆုံး ~${minRem}မိနစ်ကျန်)` : ""}`);
+      if (stopped) break;
     }
-    await prog.add(`\n🏁 ပြီးပါပြီ  ✅${ok}  ❌${fail}  ⏭${skip}`, true);
+    if (stopped) await prog.add("\n⏹ သင်ရပ်လိုက်လို့ ရပ်သွားသည်");
+    await prog.add(`\n🏁 ${stopped ? "ရပ်ပြီး" : "ပြီးပါပြီ"}  ✅${ok}  ❌${fail}  ⏭${skip}`, true);
+
+    const deadCount = Object.values(dead).reduce((n, l) => n + l.length, 0);
+    if (deadCount) {
+      Object.assign(lastFailed, dead);
+      await prog.add(`\n⚠️ ပို့လို့မရတော့တဲ့ GP ${deadCount} ခု တွေ့သည် (ပိတ်ခံရ/private/write မရ)`);
+      endRows = [[btn(`🗑 Dead GP ${deadCount} ခု စစ်/ဖျက်`, "cf")]];
+    }
   } catch (e) {
     console.error(e);
     await prog.add(`❌ Error: ${e.message}`, true);
   } finally {
     isSending = false;
-    await prog.flush(true);
+    stopSend = false;
+    await prog.finish(endRows);
   }
 }
 
 async function runJoin(accNames, links) {
   if (isJoining) { await notify("⚠️ Join လုပ်နေဆဲ ရှိသေးသည်"); return; }
   isJoining = true;
-  const prog = new Progress("🤝 GP Join");
+  stopJoin = false;
+  const prog = new Progress("🤝 GP Join", "stop:join");
+  let stopped = false;
   try {
     await prog.add(`👤 ${accNames.join(", ")}\n🔗 GP ${links.length} ခု | ⏱ ${JOIN_DELAY_SEC}s delay`);
     for (const [ai, name] of accNames.entries()) {
+      if (stopJoin) { stopped = true; break; }
       const client = clientPool[name];
       if (!client) { await prog.add(`❌ [${name}] connected မဟုတ်`); continue; }
       let ok = 0, fail = 0, already = 0;
       await prog.add(`▶️ [${name}]`);
       for (let i = 0; i < links.length; i++) {
+        if (stopJoin) { stopped = true; break; }
         try {
           await joinGroup(client, links[i]);
           ok++;
@@ -301,15 +395,17 @@ async function runJoin(accNames, links) {
           else { fail++; await prog.add(`❌ ${i + 1}. ${short(m, 70)}`); }
           if (err.seconds) { await prog.add(`⏳ Flood wait ${err.seconds}s — ရပ်လိုက်သည်`); break; }
         }
-        if (i < links.length - 1) await sleep(JOIN_DELAY_SEC);
+        if (i < links.length - 1) await sleepStop(JOIN_DELAY_SEC, () => stopJoin);
       }
       await prog.add(`📊 [${name}] ✅${ok} ❌${fail} ℹ️${already}`);
-      if (ai < accNames.length - 1) await sleep(JOIN_DELAY_SEC);
+      if (stopped) break;
+      if (ai < accNames.length - 1) await sleepStop(JOIN_DELAY_SEC, () => stopJoin);
     }
-    await prog.add("🏁 Join ပြီးပါပြီ", true);
+    await prog.add(stopped ? "⏹ သင်ရပ်လိုက်လို့ Join ရပ်သွားသည်" : "🏁 Join ပြီးပါပြီ", true);
   } finally {
     isJoining = false;
-    await prog.flush(true);
+    stopJoin = false;
+    await prog.finish();
   }
 }
 
@@ -326,6 +422,7 @@ function startScheduler() {
   nextRunAt = Date.now() + ms;
   schedulerTimer = setInterval(() => {
     nextRunAt = Date.now() + ms;
+    if (inQuiet()) { console.log("🌙 Quiet hours — scheduler skip"); return; }
     if (isSending) { notify("⏰ Scheduler: ပို့နေဆဲမို့ ဒီအကြိမ် ကျော်လိုက်သည်").catch(() => {}); return; }
     sendAllAccounts({ force: true, source: "scheduler" }).catch((e) => console.error(e));
   }, ms);
@@ -378,15 +475,23 @@ async function showHome(ctx, note) {
   t += `\n💬 Global msg: ${globalMsg ? "✅ သတ်မှတ်ပြီး" : "⚠️ မသတ်မှတ်ရသေး"}`;
   t += `\n⏰ Scheduler : ${sched}`;
   t += `\n⏱ Delay     : ${sendDelaySeconds}s (GP တစ်ခုချင်းကြား)`;
+  if (quietStart != null) t += `\n🌙 Quiet     : ${quietText()}${inQuiet() ? " — အခု ပိတ်ချိန်" : ""}`;
+  const st = await getTodayStats();
+  t += `\n📈 ယနေ့       : ✅${st.ok}  ❌${st.fail}`;
   if (isSending) t += `\n🔄 ပို့နေဆဲ...`;
+  if (isJoining) t += `\n🤝 Join လုပ်နေဆဲ...`;
   if (!accounts.length) t += `\n\n👉 စတင်ရန်: "👤 Accounts" → "➕ Account ထည့်"`;
   else t += `\n\n👇 လိုချင်တာကို နှိပ်ပါ`;
-  return render(ctx, t, [
+  const rows = [
     [btn("👤 Accounts", "accs"), btn("💬 Global Message", "gmsg")],
     [btn("📤 ယခုပို့မယ်", "send"), btn("⏰ Scheduler", "sch")],
     [btn("🤝 GP Join", "join"), btn("⚙️ Settings", "set")],
     [btn("📊 Status", "stat"), btn("🔄 Refresh", "home")],
-  ]);
+  ];
+  if (isSending) rows.unshift([btn("⏹ Send ရပ်မယ်", "stop:send")]);
+  if (isJoining) rows.unshift([btn("⏹ Join ရပ်မယ်", "stop:join")]);
+  if (isSending || isJoining || schedulerTimer) rows.unshift([btn("🛑 အကုန်ရပ် (Scheduler ပါ)", "stop:all")]);
+  return render(ctx, t, rows);
 }
 
 // ─── ACCOUNTS ─────────────────────────────────────────────────────────────────
@@ -394,11 +499,12 @@ async function showAccounts(ctx, note) {
   const accounts = await getAccounts();
   let t = `👤 Accounts (${accounts.length})\n`;
   if (note) t += `\n${note}\n`;
-  t += accounts.length ? `\n🟢 = ချိတ်ထား   🔴 = မချိတ်\nနှိပ်ပြီး စီမံပါ 👇` : `\n📭 Account မရှိသေးပါ`;
+  t += accounts.length ? `\n🟢 = ချိတ်ထား   ⏸ = ခဏရပ်ထား   🔴 = မချိတ်\nနှိပ်ပြီး စီမံပါ 👇` : `\n📭 Account မရှိသေးပါ`;
   const rows = accounts.map((a) => [
-    btn(`${clientPool[a.name] ? "🟢" : "🔴"} ${a.name} · GP ${(a.gpLinks || []).length}${a.customMsg ? " · 💬" : ""}`, `a:${a._id}`),
+    btn(`${clientPool[a.name] ? (a.paused ? "⏸" : "🟢") : "🔴"} ${a.name} · GP ${(a.gpLinks || []).length}${a.customMsg ? " · 💬" : ""}`, `a:${a._id}`),
   ]);
   rows.push([btn("➕ Account ထည့်", "add:new")]);
+  rows.push([btn("🔑 Session String ထုတ်ရုံ", "add:export")]);
   rows.push([btn("🏠 Home", "home")]);
   return render(ctx, t, rows);
 }
@@ -407,7 +513,7 @@ async function showAccount(ctx, acc, note) {
   acc = (await getAccById(String(acc._id))) || acc;
   const gps = acc.gpLinks || [];
   const on = !!clientPool[acc.name];
-  let t = `👤 ${acc.name}\n${on ? "🟢 Connected" : "🔴 Disconnected (🔄 Reconnect နှိပ်ပါ)"}\n`;
+  let t = `👤 ${acc.name}\n${on ? "🟢 Connected" : "🔴 Disconnected (🔄 Reconnect နှိပ်ပါ)"}${acc.paused ? "  ·  ⏸ PAUSED (send မှာ ကျော်မယ်)" : ""}\n`;
   if (note) t += `\n${note}\n`;
   t += `\n💬 Message: ${acc.customMsg ? "custom (ဒီ account သီးသန့်)" : globalMsg ? "global သုံးနေ" : "⚠️ မသတ်မှတ်ရသေး"}`;
   t += `\n🔗 GP: ${gps.length} ခု`;
@@ -425,7 +531,9 @@ async function showAccount(ctx, acc, note) {
   ];
   if (acc.customMsg) rows.push([btn("👁 Message ကြည့်", `a:${id}:msgv`), btn("🧽 Message ဖျက်", `a:${id}:msgclr`)]);
   rows.push([btn("🤝 Join", `a:${id}:join`), btn("📤 ဒီ account ပို့", `a:${id}:send`)]);
-  rows.push([btn("🔄 Reconnect", `a:${id}:rc`), btn("🗑 Account ဖျက်", `a:${id}:del`)]);
+  rows.push([btn(acc.paused ? "▶️ ပြန်စ (Resume)" : "⏸ ခဏရပ် (Pause)", `a:${id}:pause`), btn("🧪 Test (Saved Msg)", `a:${id}:test`)]);
+  rows.push([btn("🔄 Reconnect", `a:${id}:rc`), btn("🔑 Session ကြည့်", `a:${id}:sess`)]);
+  rows.push([btn("🗑 Account ဖျက်", `a:${id}:del`)]);
   rows.push([btn("⬅️ Accounts", "accs")]);
   return render(ctx, t, rows);
 }
@@ -495,6 +603,27 @@ async function accRoute(ctx, [id, action, arg]) {
       runBg(() => sendAllAccounts({ force: true, onlyName: acc.name }));
       return render(ctx, `⚡ [${acc.name}] Force send စတင်ပြီ`, back);
 
+    case "pause":
+      await saveAccount(acc.name, { paused: !acc.paused });
+      return showAccount(ctx, acc, acc.paused ? "▶️ ပြန်စပြီး" : "⏸ ခဏရပ်ထားပြီး — auto/manual send မှာ ကျော်မယ်");
+
+    case "test": {
+      const m = acc.customMsg || globalMsg;
+      if (!m) return showAccount(ctx, acc, "⚠️ Message မသတ်မှတ်ရသေး");
+      const c = clientPool[acc.name];
+      if (!c) return showAccount(ctx, acc, "🔴 Connected မဟုတ်ပါ");
+      try {
+        await c.sendMessage("me", { message: pickSpun(m), parseMode: "html", linkPreview: false });
+        return showAccount(ctx, acc, "🧪 Saved Messages ထဲ ပို့ပြီး — Telegram app မှာ စစ်ကြည့်ပါ");
+      } catch (e) { return showAccount(ctx, acc, `❌ ${e.message}`); }
+    }
+
+    case "sess":
+      return ctx.reply(
+        `🔑 [${acc.name}] Session String (backup/ရွှေ့ဖို့)\n\n<code>${acc.sessionString}</code>\n\n⚠️ ဒါက password လိုပဲ — copy ပြီးရင် ဒီ message ကို ဖျက်ပါ`,
+        { parse_mode: "HTML", reply_markup: { inline_keyboard: back } }
+      );
+
     case "rc":
       try {
         await reconnectAccount(acc);
@@ -543,7 +672,7 @@ async function connectSession(name, sessionString) {
   }
 }
 
-async function loginWithPhone(name, phone) {
+async function loginWithPhone(name, phone, exportOnly = false) {
   const client = new TelegramClient(new StringSession(""), API_ID, API_HASH, { connectionRetries: 5 });
   let attempts = 0;
   try {
@@ -570,6 +699,14 @@ async function loginWithPhone(name, phone) {
       },
     });
     const sessionString = client.session.save();
+    if (exportOnly) {
+      await notify(
+        `✅ Session String ရပြီ 👇 (ဒီ account ကို bot ထဲ မသိမ်းထားပါ)\n\n<code>${sessionString}</code>\n\n⚠️ ဒါက password လိုပဲ အရေးကြီးတယ် — copy ပြီးရင် ဒီ message ကို ဖျက်ပါ`,
+        { parse_mode: "HTML", reply_markup: { inline_keyboard: [[btn("🏠 Home", "home")]] } }
+      );
+      await client.disconnect();
+      return;
+    }
     await saveNewAccount(name, client, sessionString);
     const acc = await getAccount(name);
     await notify(`✅ "${name}" login အောင်မြင်! 🎉`, {
@@ -588,6 +725,9 @@ async function addRoute(ctx, [action]) {
     case "new":
       setAwait("add_name");
       return render(ctx, `➕ Account အသစ်\n\nနာမည်တစ်ခု ပေးပါ (ဥပမာ: မိဘ၊ acc1)\nစာသားနဲ့ ရိုက်ပို့ပါ 👇`, cancelRows);
+    case "export":
+      setAwait("add_phone", { name: "(session ထုတ်ရုံ)", exportOnly: true });
+      return render(ctx, `🔑 Session String ထုတ်ရုံ\n\nဖုန်းနံပါတ် ပို့ပါ (ဥပမာ +959792310926)\nAccount ကို bot ထဲ သိမ်းမှာမဟုတ်ဘဲ string ကိုပဲ ပြပေးမယ်`, cancelRows);
     case "phone": {
       if (awaiting?.type !== "add_pick") return showAccounts(ctx);
       const name = awaiting.name;
@@ -610,7 +750,7 @@ async function showGlobalMsg(ctx, note) {
   t += globalMsg ? `\n"${globalMsg}"` : `\n⚠️ မသတ်မှတ်ရသေး`;
   t += `\n\n💡 Spin: မင်္ဂလာပါ{spin}ဟေး{spin}ဟယ်လို\n→ ပို့တိုင်း တစ်မျိုးစီ ပြောင်းပို့`;
   const rows = [[btn("✏️ Message ပြောင်း", "gmsg:set")]];
-  if (globalMsg) rows[0].push(btn("🧽 ဖျက်", "gmsg:clr"));
+  if (globalMsg) { rows[0].push(btn("🧽 ဖျက်", "gmsg:clr")); rows.push([btn("🧪 Test (Saved Messages ထဲပို့)", "gmsg:test")]); }
   rows.push([btn("🏠 Home", "home")]);
   return render(ctx, t, rows);
 }
@@ -637,6 +777,7 @@ function showScheduler(ctx, note) {
   if (note) t += `\n${note}\n`;
   t += `\nအခြေအနေ: ${on ? "🟢 ဖွင့်ထား" : "🔴 ပိတ်ထား"}`;
   t += `\nကြားကာလ: ${fmtMin(intervalMinutes)} တစ်ကြိမ်${nextRunText()}`;
+  t += `\n🌙 Quiet hours: ${quietText()} (Settings မှာ ပြောင်း)`;
   t += `\n\n💡 Interval ကို အောက်က နှိပ်လိုက်တာနဲ့ ချက်ချင်း ဖွင့်ပေးမယ်`;
   t += `\n💡 Auto ပို့တာက cooldown မစစ်ဘဲ interval အတိုင်း အတိအကျ ပို့ပါတယ်`;
   return render(ctx, t, [
@@ -653,10 +794,14 @@ function showSettings(ctx, note) {
   let t = `⚙️ Settings\n`;
   if (note) t += `\n${note}\n`;
   t += `\n⏱ Send delay: ${sendDelaySeconds}s\n   (GP တစ်ခုချင်း ပို့တဲ့ကြား စောင့်ချိန်။ နည်းလွန်းရင် Telegram က limit ကန့်သတ်နိုင်)`;
+  t += `\n🎲 Random delay: ${jitter ? "🟢 ON (delay ±25% ပြောင်း — ပိုသဘာဝကျ)" : "🔴 OFF"}`;
   t += `\n⏰ Interval : ${fmtMin(intervalMinutes)} (Scheduler မှာ ပြောင်းပါ)`;
+  t += `\n🌙 Quiet hours: ${quietText()}\n   (ဒီအချိန်တွင်း Scheduler က မပို့ဘူး — manual send ကတော့ ရ)`;
   return render(ctx, t, [
     [btn("3s", "set:dly:3"), btn("6s", "set:dly:6"), btn("10s", "set:dly:10"), btn("15s", "set:dly:15"), btn("30s", "set:dly:30")],
-    [btn("✏️ Delay ကိုယ်တိုင်ရိုက်", "set:dlyc")],
+    [btn("✏️ Delay ကိုယ်တိုင်ရိုက်", "set:dlyc"), btn(jitter ? "🎲 Random ပိတ်" : "🎲 Random ဖွင့်", "set:jit")],
+    [btn("🌙 Quiet ပိတ်", "set:q:off"), btn("23-07", "set:q:23-7"), btn("00-06", "set:q:0-6")],
+    [btn("✏️ Quiet hours ကိုယ်တိုင် (ဥပမာ 22-6)", "set:qc")],
     [btn("⏰ Scheduler သို့", "sch")],
     [btn("🏠 Home", "home")],
   ]);
@@ -666,13 +811,18 @@ function showSettings(ctx, note) {
 async function showStatus(ctx) {
   const accounts = await getAccounts();
   const connected = accounts.filter((a) => clientPool[a.name]).length;
+  const st = await getTodayStats();
   let t = `📊 Status\n\n👤 Accounts: ${accounts.length} (🟢${connected})`;
+  t += `\n📈 ယနေ့ စုစုပေါင်း: ✅${st.ok}  ❌${st.fail}`;
+  if (quietStart != null) t += `\n🌙 Quiet: ${quietText()}`;
   t += `\n💬 Global msg: ${globalMsg ? `"${short(globalMsg, 30)}"` : "⚠️ မသတ်မှတ်ရသေး"}`;
   t += `\n⏰ Scheduler: ${schedulerTimer ? `🟢 ${fmtMin(intervalMinutes)}${nextRunText()}` : "🔴 ပိတ်"}`;
   t += `\n⏱ Delay: ${sendDelaySeconds}s | 🔄 ပို့နေဆဲ: ${isSending ? "ဟုတ်" : "မဟုတ်"}`;
   for (const acc of accounts) {
     const gps = acc.gpLinks || [];
-    t += `\n\n━━━━━━━━━━━━\n${clientPool[acc.name] ? "🟢" : "🔴"} ${acc.name} · GP ${gps.length} · msg ${acc.customMsg ? "custom" : "global"}`;
+    t += `\n\n━━━━━━━━━━━━\n${clientPool[acc.name] ? (acc.paused ? "⏸" : "🟢") : "🔴"} ${acc.name} · GP ${gps.length} · msg ${acc.customMsg ? "custom" : "global"}`;
+    const as = st.by[acc.name];
+    if (as) t += `\n📈 ယနေ့ ✅${as.ok || 0} ❌${as.fail || 0}`;
     for (let i = 0; i < gps.length && i < 15; i++) {
       const last = await getLastSent(acc.name, gps[i]);
       const rem = last ? Math.ceil(intervalMinutes - (Date.now() - new Date(last).getTime()) / 60000) : 0;
@@ -718,6 +868,7 @@ bot.start(adminOnly, (ctx) => { cancelAwait(); return showHome(ctx); });
 bot.command(["panel", "menu"], adminOnly, (ctx) => { cancelAwait(); return showHome(ctx); });
 bot.command("status", adminOnly, (ctx) => showStatus(ctx));
 bot.command("send", adminOnly, (ctx) => { runBg(() => sendAllAccounts({ force: false })); return ctx.reply("📤 ပို့စတင်ပြီ..."); });
+bot.command("stop", adminOnly, (ctx) => ctx.reply(doStop("all"), { reply_markup: { inline_keyboard: [[btn("🏠 Home", "home")]] } }));
 bot.command("cancel", adminOnly, (ctx) => { cancelAwait(); draft = null; return showHome(ctx, "❌ ပယ်ဖျက်ပြီး"); });
 
 // ─── CALLBACKS ────────────────────────────────────────────────────────────────
@@ -745,6 +896,15 @@ async function route(ctx, p) {
       if (a === "set") {
         setAwait("global_msg");
         return render(ctx, `💬 Global message ပို့ပါ\n\n💡 Spin: မင်္ဂလာပါ{spin}ဟေး{spin}ဟယ်လို ညီကိုများ\n💡 HTML သုံးလို့ရ: <b>bold</b>  <a href="https://t.me/xxx">link</a>`, cancelRows);
+      }
+      if (a === "test") {
+        if (!globalMsg) return showGlobalMsg(ctx, "⚠️ Message မသတ်မှတ်ရသေး");
+        const accs = (await getAccounts()).filter((x) => clientPool[x.name]);
+        if (!accs.length) return showGlobalMsg(ctx, "🔴 Connected account မရှိပါ");
+        try {
+          await clientPool[accs[0].name].sendMessage("me", { message: pickSpun(globalMsg), parseMode: "html", linkPreview: false });
+          return showGlobalMsg(ctx, `🧪 [${accs[0].name}] ရဲ့ Saved Messages ထဲ ပို့ပြီး`);
+        } catch (e) { return showGlobalMsg(ctx, `❌ ${e.message}`); }
       }
       if (a === "clr") { globalMsg = ""; await saveSettings({ globalMsg }); return showGlobalMsg(ctx, "🧽 ဖျက်ပြီး"); }
       return showGlobalMsg(ctx);
@@ -780,10 +940,47 @@ async function route(ctx, p) {
         await saveSettings({ sendDelaySeconds });
         return showSettings(ctx, `✅ Delay ${sendDelaySeconds}s`);
       }
+      if (a === "jit") { jitter = !jitter; await saveSettings({ jitter }); return showSettings(ctx, `🎲 Random delay ${jitter ? "ဖွင့်ပြီး" : "ပိတ်ပြီး"}`); }
+      if (a === "q") {
+        if (b === "off") { quietStart = quietEnd = null; }
+        else {
+          const m = (b || "").match(/^(\d+)-(\d+)$/);
+          if (!m) return showSettings(ctx);
+          quietStart = parseInt(m[1]); quietEnd = parseInt(m[2]);
+        }
+        await saveSettings({ quietStart, quietEnd });
+        return showSettings(ctx, quietStart == null ? "🌙 Quiet hours ပိတ်ပြီး" : `🌙 Quiet hours ${quietText()}`);
+      }
+      if (a === "qc") { setAwait("quiet_custom"); return render(ctx, "✏️ Quiet hours ရိုက်ပို့ပါ (မြန်မာစံတော်ချိန်, 24 နာရီ)\nပုံစံ: စ-ဆုံး  ဥပမာ 23-7 (ည ၁၁ နာရီ ကနေ မနက် ၇ နာရီ)", cancelRows); }
       if (a === "dlyc") { setAwait("dly_custom"); return render(ctx, "✏️ Delay စက္ကန့် ရိုက်ပို့ပါ (ဥပမာ 8)", cancelRows); }
       return showSettings(ctx);
 
     case "stat": return showStatus(ctx);
+
+    case "stop":
+      return ctx.reply(doStop(a || "all"), { reply_markup: { inline_keyboard: [[btn("🏠 Home", "home")]] } });
+
+    case "cf": { // Dead GP cleanup
+      const names = Object.keys(lastFailed).filter((n) => lastFailed[n]?.length);
+      if (!names.length) return showHome(ctx, "ℹ️ ဖျက်စရာ dead GP မရှိပါ");
+      if (a === "ok") {
+        let n = 0;
+        for (const name of names) {
+          const acc = await getAccount(name);
+          if (!acc) continue;
+          const before = (acc.gpLinks || []).length;
+          const gps = (acc.gpLinks || []).filter((l) => !lastFailed[name].includes(l));
+          await saveAccount(name, { gpLinks: gps });
+          n += before - gps.length;
+        }
+        lastFailed = {};
+        return showHome(ctx, `🗑 Dead GP ${n} ခု ဖျက်ပြီး`);
+      }
+      let t = "🗑 ပို့လို့မရတော့တဲ့ GP တွေ (ပိတ်ခံရ / private / write မရ):\n";
+      for (const name of names) t += `\n👤 ${name}\n` + lastFailed[name].map((l, i) => `${i + 1}. ${short(l, 40)}`).join("\n") + "\n";
+      t += "\nအကုန် GP list ထဲက ဖျက်မလား?";
+      return ctx.reply(clip(t), { reply_markup: { inline_keyboard: [[btn("✅ အကုန်ဖျက်", "cf:ok"), btn("⬅️ မဖျက်ဘူး", "home")]] }, link_preview_options: { is_disabled: true } });
+    }
 
     case "join":
       if (!a) return showJoin(ctx);
@@ -829,7 +1026,7 @@ bot.on("text", adminOnly, async (ctx) => {
       if (digits.length < 8) return ctx.reply("⚠️ ဖုန်းနံပါတ် မှန်မှန်ရိုက်ပါ (ဥပမာ +959792310926)");
       awaiting = null;
       const phone = "+" + digits;
-      runBg(() => loginWithPhone(a.name, phone));
+      runBg(() => loginWithPhone(a.name, phone, !!a.exportOnly));
       return ctx.reply(`⏳ ${phone} ဆီ code ပို့ခိုင်းနေသည်...`);
     }
 
@@ -902,6 +1099,15 @@ bot.on("text", adminOnly, async (ctx) => {
       return showScheduler(ctx, `✅ ${fmtMin(mins)} တစ်ကြိမ် သတ်မှတ်ပြီး ဖွင့်လိုက်ပြီ`);
     }
 
+    case "quiet_custom": {
+      const m = raw.match(/^(\d{1,2})\s*-\s*(\d{1,2})$/);
+      if (!m || +m[1] > 23 || +m[2] > 23 || m[1] === m[2]) return ctx.reply("⚠️ Format: 23-7 (နာရီ 0-23, စ-ဆုံး မတူရ)");
+      awaiting = null;
+      quietStart = parseInt(m[1]); quietEnd = parseInt(m[2]);
+      await saveSettings({ quietStart, quietEnd });
+      return showSettings(ctx, `🌙 Quiet hours ${quietText()}`);
+    }
+
     case "dly_custom": {
       const n = parseInt(raw);
       if (!n || n < 1) return ctx.reply("⚠️ နံပါတ်ရိုက်ပါ (ဥပမာ 8)");
@@ -950,6 +1156,8 @@ async function main() {
   if (s.globalMsg)        globalMsg        = s.globalMsg;
   if (s.intervalMinutes)  intervalMinutes  = s.intervalMinutes;
   if (s.sendDelaySeconds) sendDelaySeconds = s.sendDelaySeconds;
+  if (typeof s.jitter === "boolean") jitter = s.jitter;
+  if (typeof s.quietStart === "number" && typeof s.quietEnd === "number") { quietStart = s.quietStart; quietEnd = s.quietEnd; }
 
   await initAllClients();
   if (s.schedulerOn && intervalMinutes > 0) startScheduler();
