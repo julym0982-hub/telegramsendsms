@@ -223,6 +223,8 @@ async function buildClient(sessionString, accName = null) {
     throw e;
   }
   if (accName) {
+    // group/channel update တွေ ပုံမှန်ဝင်လာဖို့ dialog list ကို တစ်ခါ load (entity cache + update state အသက်သွင်း)
+    try { await client.getDialogs({ limit: 200 }); } catch (e) { console.error(`getDialogs[${accName}]:`, e.message); }
     client.addEventHandler((event) => {
       handleIncomingMessage(accName, event).catch((e) => console.error(`trigger[${accName}]:`, e.message));
     }, new NewMessage({}));
@@ -342,7 +344,10 @@ async function handleIncomingMessage(accName, event) {
 
   let chatId;
   try { chatId = msg.chatId?.toString(); } catch (_) { chatId = null; }
-  if (!chatId) return;
+  if (!chatId) { // chatId getter မရရင် peerId ကနေ တိုက်ရိုက်တွက်
+    try { chatId = msg.peerId ? utils.getPeerId(msg.peerId).toString() : null; } catch (_) { chatId = null; }
+  }
+  if (!chatId) { console.log(`trigger[${accName}]: chatId ရှာမရ — ကျော်`); return; }
   console.log(`trigger[${accName}]: 📨 message ဝင်လာသည် chatId=${chatId}`); // event handler ကိုယ်တိုင် message ရနေလားဆိုတာ သက်သေ
 
   if (!triggerChats[accName]) await buildTriggerChats(accName);
