@@ -208,7 +208,12 @@ async function getJoinedGroups(client, limit = 60) {
 }
 
 async function buildClient(sessionString, accName = null) {
-  const client = new TelegramClient(new StringSession(sessionString), API_ID, API_HASH, { connectionRetries: 5 });
+  const client = new TelegramClient(new StringSession(sessionString), API_ID, API_HASH, {
+    connectionRetries: 10,   // Render ↔ Telegram DC connection မတည်ငြိမ်ရင် ထပ်ကြိုးစားအောင်
+    retryDelay: 2000,
+    autoReconnect: true,
+    requestRetries: 5,
+  });
   await client.connect();
   try {
     const me = await client.getMe(); // session အသုံးဝင်မဝင် စစ်
@@ -236,6 +241,22 @@ async function initAllClients() {
       console.error(`❌ Failed: ${acc.name} — ${e.message}`);
     }
   }
+}
+
+// Network (TIMEOUT) ကြောင့် client က "connected" ပုံပေါ်ပေမယ့် တကယ်ချိတ်ဆက်မှု ပျက်နေတဲ့ account တွေကို
+// ကိုယ်တိုင်တွေ့အောင် ခဏတလေ စစ်ပြီး auto-reconnect ပြန်လုပ်ပေးသည် — Activity-trigger ဆက်ကြားနေစေရန်
+function startHealthCheck() {
+  setInterval(async () => {
+    for (const acc of await getAccounts()) {
+      const client = clientPool[acc.name];
+      if (!client) continue; // disconnected ဖြစ်နေရင် manual Reconnect လိုအပ်သည် (auto မလုပ်ဘူး — crash loop ကာကွယ်ရန်)
+      if (!client.connected) {
+        console.log(`healthcheck[${acc.name}]: connected=false တွေ့ — auto-reconnect လုပ်နေသည်`);
+        try { await reconnectAccount(acc); console.log(`healthcheck[${acc.name}]: reconnect အောင်မြင်ပြီး`); }
+        catch (e) { console.error(`healthcheck[${acc.name}]: reconnect မအောင်မြင် — ${e.message}`); delete clientPool[acc.name]; }
+      }
+    }
+  }, 5 * 60 * 1000); // ၅ မိနစ်တစ်ခါ
 }
 
 async function reconnectAccount(acc) {
@@ -322,6 +343,7 @@ async function handleIncomingMessage(accName, event) {
   let chatId;
   try { chatId = msg.chatId?.toString(); } catch (_) { chatId = null; }
   if (!chatId) return;
+  console.log(`trigger[${accName}]: 📨 message ဝင်လာသည် chatId=${chatId}`); // event handler ကိုယ်တိုင် message ရနေလားဆိုတာ သက်သေ
 
   if (!triggerChats[accName]) await buildTriggerChats(accName);
   let link = triggerChats[accName]?.get(chatId);
@@ -329,7 +351,7 @@ async function handleIncomingMessage(accName, event) {
     await buildTriggerChats(accName);
     link = triggerChats[accName]?.get(chatId);
   }
-  if (!link) return; // ဒီ account ရဲ့ GP list ထဲမပါတဲ့ chat (log မထွက်ဘူး — GP အများကြီးရှိရင် noise ဖြစ်မှာမို့)
+  if (!link) { console.log(`trigger[${accName}]: chatId=${chatId} ဟာ monitor list ထဲမပါ — ကျော်`); return; } // ဒီ account ရဲ့ GP list ထဲမပါတဲ့ chat
 
   const senderId = (() => { try { return msg.senderId?.toString(); } catch (_) { return null; } })();
   if (senderId && ownIds.has(senderId)) {
@@ -1449,6 +1471,7 @@ async function main() {
 
   await initAllClients();
   if (s.schedulerOn && intervalMinutes > 0) startScheduler();
+  startHealthCheck();
 
   await bot.telegram.deleteWebhook({ drop_pending_updates: true });
 
