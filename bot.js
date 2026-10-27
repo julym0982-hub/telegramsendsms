@@ -310,6 +310,7 @@ async function buildTriggerChats(accName) {
     }
   }
   triggerChats[accName] = map;
+  console.log(`trigger[${accName}]: GP ${map.size}/${(acc?.gpLinks || []).length} ခု resolve လုပ်နိုင်ပြီး monitor လုပ်နေသည်`);
 }
 
 async function handleIncomingMessage(accName, event) {
@@ -328,14 +329,18 @@ async function handleIncomingMessage(accName, event) {
     await buildTriggerChats(accName);
     link = triggerChats[accName]?.get(chatId);
   }
-  if (!link) return; // ဒီ account ရဲ့ GP list ထဲမပါတဲ့ chat
+  if (!link) return; // ဒီ account ရဲ့ GP list ထဲမပါတဲ့ chat (log မထွက်ဘူး — GP အများကြီးရှိရင် noise ဖြစ်မှာမို့)
 
   const senderId = (() => { try { return msg.senderId?.toString(); } catch (_) { return null; } })();
-  if (senderId && ownIds.has(senderId)) return; // ကိုယ့် account တွေချင်း count မထည့်ဘူး
+  if (senderId && ownIds.has(senderId)) {
+    console.log(`trigger[${accName}]: ${short(link, 30)} — ကိုယ့် account ကိုယ် ပို့တဲ့ message မို့ ကျော်`);
+    return; // ကိုယ့် account တွေချင်း count မထည့်ဘူး
+  }
 
   const key = `${accName}|${chatId}`;
   const threshold = Math.max(1, acc.triggerThreshold || triggerThreshold);
   triggerCounts[key] = (triggerCounts[key] || 0) + 1;
+  console.log(`trigger[${accName}]: ${short(link, 30)} — message count ${triggerCounts[key]}/${threshold}`);
   if (triggerCounts[key] < threshold) return; // user count မပြည့်သေး
 
   const msgText = acc.customMsg || globalMsg;
@@ -347,11 +352,15 @@ async function handleIncomingMessage(accName, event) {
   const cdMin = acc.triggerCooldownMin ?? triggerCooldownDefault;
   if (cdMin > 0) {
     const lastT = await getLastSent(accName, trgLogKey);
-    if (lastT && (Date.now() - new Date(lastT).getTime()) / 60000 < cdMin) return; // cooldown ပြည့်အောင်စောင့်
+    if (lastT && (Date.now() - new Date(lastT).getTime()) / 60000 < cdMin) {
+      console.log(`trigger[${accName}]: ${short(link, 30)} — count ပြည့်ပြီ၊ cooldown မပြည့်သေးလို့ စောင့်နေသည်`);
+      return; // cooldown ပြည့်အောင်စောင့်
+    }
   }
 
   const client = clientPool[accName];
-  if (!client) return;
+  if (!client) { console.log(`trigger[${accName}]: client မရှိ (disconnected) — ပို့လို့မရပါ`); return; }
+  console.log(`trigger[${accName}]: ${short(link, 30)} — threshold+cooldown ပြည့်ပြီ → ပို့တော့မည်`);
   const lockKey = `${accName}|${link}`;
   try {
     const { locked } = await withGpLock(lockKey, async () => {
@@ -412,9 +421,13 @@ async function sendAllAccounts({ force = false, onlyName = null, source = "manua
   try {
     const accounts = (await getAccounts()).filter((a) => !onlyName || a.name === onlyName);
     const pausedN = accounts.filter((a) => a.paused && !onlyName).length;
-    const active = accounts.filter((a) => clientPool[a.name] && (!a.paused || onlyName));
-    if (!active.length) { await prog.add(`⚠️ ပို့လို့ရတဲ့ account မရှိပါ${pausedN ? ` (⏸ paused ${pausedN})` : ""}`); return; }
-    await prog.add(`👤 Active ${active.length}${pausedN ? ` (⏸ ${pausedN} ကျော်)` : ""} | ⏱ delay ${sendDelaySeconds}s${jitter ? " 🎲" : ""}`);
+    // 🎯 Activity-trigger ဖွင့်ထားတဲ့ account ကို scheduler/multi-account send ကနေ ဖယ်ထားမယ် — trigger
+    // ကိုယ်တိုင် ကိုင်တွယ်နေပြီဖြစ်လို့ ပေါင်းပို့ရင် GP ကို ပေါင်းပို့ခြင်း/ထပ်ကြိမ်ပို့ခြင်း ဖြစ်တတ်ပါတယ်။
+    // "ဒီ account ပို့" ဆိုပြီး account သီးသန့် ရွေးပို့တာ (onlyName) ကိုတော့ မဆိုင်ပါ — အတင်းပို့ပေးမယ်။
+    const trgSkipN = accounts.filter((a) => a.triggerOn && !onlyName).length;
+    const active = accounts.filter((a) => clientPool[a.name] && (!a.paused || onlyName) && (onlyName || !a.triggerOn));
+    if (!active.length) { await prog.add(`⚠️ ပို့လို့ရတဲ့ account မရှိပါ${pausedN ? ` (⏸ paused ${pausedN})` : ""}${trgSkipN ? ` (🎯 trigger ${trgSkipN})` : ""}`); return; }
+    await prog.add(`👤 Active ${active.length}${pausedN ? ` (⏸ ${pausedN} ကျော်)` : ""}${trgSkipN ? ` (🎯 trigger-on ${trgSkipN} ကျော် — trigger ကသီးသန့်ပို့မယ်)` : ""} | ⏱ delay ${sendDelaySeconds}s${jitter ? " 🎲" : ""}`);
 
     for (const acc of active) {
       if (stopSend) { stopped = true; break; }
