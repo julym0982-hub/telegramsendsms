@@ -3,6 +3,7 @@ const { Telegraf } = require("telegraf");
 const { TelegramClient } = require("telegram");
 const { StringSession } = require("telegram/sessions");
 const { Api } = require("telegram/tl");
+const { NewMessage } = require("telegram/events");
 const { MongoClient, ObjectId } = require("mongodb");
 const http = require("http");
 const https = require("https");
@@ -38,6 +39,10 @@ let jitter           = true;  // delay ကို random အနည်းငယ်
 let quietStart       = null;  // 🌙 Quiet hours (မြန်မာစံတော်ချိန်) — null = ပိတ်
 let quietEnd         = null;
 let lastFailed       = {};    // accName → [dead GP links] (နောက်ဆုံး send က)
+let triggerThreshold = 4;     // 🎯 default: အခြား user က message ဒီအကြိမ်ရေ ပို့ရင် auto-trigger
+const triggerCounts  = {};    // `${accName}|${chatId}` → count (memory ထဲပဲ)
+const triggerChats   = {};    // accName → Map(chatId → gpLink) — ဒီ account က monitor လုပ်မယ့် GP တွေ
+const ownIds         = new Set(); // ကိုယ့် account တွေရဲ့ Telegram user id (အချင်းချင်း count မထည့်ဖို့)
 
 const bot = new Telegraf(BOT_TOKEN);
 
@@ -195,14 +200,20 @@ async function getJoinedGroups(client, limit = 60) {
   return out;
 }
 
-async function buildClient(sessionString) {
+async function buildClient(sessionString, accName = null) {
   const client = new TelegramClient(new StringSession(sessionString), API_ID, API_HASH, { connectionRetries: 5 });
   await client.connect();
   try {
-    await client.getMe(); // session အသုံးဝင်မဝင် စစ်
+    const me = await client.getMe(); // session အသုံးဝင်မဝင် စစ်
+    if (me?.id) ownIds.add(me.id.toString());
   } catch (e) {
     try { await client.disconnect(); } catch (_) {}
     throw e;
+  }
+  if (accName) {
+    client.addEventHandler((event) => {
+      handleIncomingMessage(accName, event).catch((e) => console.error(`trigger[${accName}]:`, e.message));
+    }, new NewMessage({}));
   }
   return client;
 }
@@ -211,8 +222,9 @@ async function initAllClients() {
   for (const acc of await getAccounts()) {
     if (clientPool[acc.name]) continue;
     try {
-      clientPool[acc.name] = await buildClient(acc.sessionString);
+      clientPool[acc.name] = await buildClient(acc.sessionString, acc.name);
       console.log(`✅ Connected: ${acc.name}`);
+      if (acc.triggerOn) buildTriggerChats(acc.name).catch(() => {});
     } catch (e) {
       console.error(`❌ Failed: ${acc.name} — ${e.message}`);
     }
@@ -224,7 +236,9 @@ async function reconnectAccount(acc) {
     try { await clientPool[acc.name].disconnect(); } catch (_) {}
     delete clientPool[acc.name];
   }
-  clientPool[acc.name] = await buildClient(acc.sessionString);
+  clientPool[acc.name] = await buildClient(acc.sessionString, acc.name);
+  delete triggerChats[acc.name];
+  if (acc.triggerOn) buildTriggerChats(acc.name).catch(() => {});
 }
 
 async function joinGroup(client, link) {
@@ -261,6 +275,71 @@ async function sendToGroup(accName, client, link, message) {
 }
 
 const isDeadSession = (e) => /AUTH_KEY|SESSION_REVOKED|SESSION_EXPIRED|USER_DEACTIVATED/.test(e.message || "");
+
+// ─── 🎯 ACTIVITY AUTO-TRIGGER ───────────────────────────────────────────────────
+// GP ထဲမှာ အခြား user (ကိုယ့် account မဟုတ်တဲ့သူ) တွေက message အကြိမ်ရေ သတ်မှတ်ထားသလောက်
+// ပို့ပြီးတဲ့အခါ၊ ရွေးထားတဲ့ account ကနေ auto ပို့ပေးတဲ့ စနစ်။ Timer scheduler နဲ့ သီးခြားစီ အလုပ်လုပ်သည်။
+async function buildTriggerChats(accName) {
+  const acc = await getAccount(accName);
+  const client = clientPool[accName];
+  const map = new Map();
+  if (acc && client) {
+    for (const link of acc.gpLinks || []) {
+      try {
+        const entity = await resolveEntity(accName, client, link);
+        map.set(entity.id.toString(), link);
+      } catch (_) {} // join မလုပ်ရသေးတဲ့ GP ကျော်
+    }
+  }
+  triggerChats[accName] = map;
+}
+
+async function handleIncomingMessage(accName, event) {
+  const msg = event?.message;
+  if (!msg || msg.out) return; // ကိုယ်တိုင်ပို့တဲ့ message
+  const acc = await getAccount(accName);
+  if (!acc || !acc.triggerOn) return;
+
+  let chatId;
+  try { chatId = msg.chatId?.toString(); } catch (_) { chatId = null; }
+  if (!chatId) return;
+
+  if (!triggerChats[accName]) await buildTriggerChats(accName);
+  let link = triggerChats[accName]?.get(chatId);
+  if (!link) { // GP list အသစ်ဖြစ်နိုင်လို့ တစ်ခါ ပြန် rebuild
+    await buildTriggerChats(accName);
+    link = triggerChats[accName]?.get(chatId);
+  }
+  if (!link) return; // ဒီ account ရဲ့ GP list ထဲမပါတဲ့ chat
+
+  const senderId = (() => { try { return msg.senderId?.toString(); } catch (_) { return null; } })();
+  if (senderId && ownIds.has(senderId)) return; // ကိုယ့် account တွေချင်း count မထည့်ဘူး
+
+  const key = `${accName}|${chatId}`;
+  const threshold = Math.max(1, acc.triggerThreshold || triggerThreshold);
+  triggerCounts[key] = (triggerCounts[key] || 0) + 1;
+  if (triggerCounts[key] < threshold) return;
+  triggerCounts[key] = 0;
+
+  const msgText = acc.customMsg || globalMsg;
+  if (!msgText) return; // message မသတ်မှတ်ရသေးရင် မပို့ဘူး
+
+  // GP တစ်ခုအတွက် interval cooldown ကို scheduler/manual send နဲ့အတူ သုံးစွဲသည် (spam မဖြစ်အောင်)
+  const last = await getLastSent(accName, link);
+  if (last && (Date.now() - new Date(last).getTime()) / 60000 < intervalMinutes) return;
+
+  const client = clientPool[accName];
+  if (!client) return;
+  try {
+    await sendToGroup(accName, client, link, pickSpun(msgText));
+    await updateLastSent(accName, link);
+    await incStats(accName, 1, 0);
+    notify(`🎯 [${accName}] Activity trigger — အခြား user ${threshold} ကြိမ် post ပြီးလို့ auto ပို့ပြီး\n${short(link, 50)}`).catch(() => {});
+  } catch (e) {
+    await incStats(accName, 0, 1);
+    notify(`🎯 [${accName}] Activity trigger ပို့လို့မရ — ${short(e.message || "error", 80)}\n${short(link, 50)}`).catch(() => {});
+  }
+}
 
 // ─── PROGRESS (message တစ်ခုတည်းကို edit လုပ်ပြီး အခြေအနေပြ) ─────────────────
 class Progress {
@@ -547,6 +626,7 @@ async function showAccount(ctx, acc, note) {
   if (note) t += `\n${note}\n`;
   t += `\n💬 Message: ${acc.customMsg ? "custom (ဒီ account သီးသန့်)" : globalMsg ? "global သုံးနေ" : "⚠️ မသတ်မှတ်ရသေး"}`;
   t += `\n🔗 GP: ${gps.length} ခု`;
+  t += `\n🎯 Activity-trigger: ${acc.triggerOn ? `🟢 ဖွင့်ထား (${acc.triggerThreshold || triggerThreshold} ကြိမ်)` : "⚪ ပိတ်ထား"}`;
   for (let i = 0; i < gps.length && i < 40; i++) {
     const last = await getLastSent(acc.name, gps[i]);
     const rem = last ? Math.ceil(intervalMinutes - (Date.now() - new Date(last).getTime()) / 60000) : 0;
@@ -563,6 +643,7 @@ async function showAccount(ctx, acc, note) {
   rows.push([btn("🤝 Join", `a:${id}:join`), btn("📤 ဒီ account ပို့", `a:${id}:send`)]);
   rows.push([btn(acc.paused ? "▶️ ပြန်စ (Resume)" : "⏸ ခဏရပ် (Pause)", `a:${id}:pause`), btn("🧪 Test (Saved Msg)", `a:${id}:test`)]);
   rows.push([btn("👁 Profile ကြည့်", `a:${id}:prof`), btn("📂 ဝင်ပြီးသား GP များ", `a:${id}:dlg`)]);
+  rows.push([btn(acc.triggerOn ? `🎯 Activity-trigger ⚪ ပိတ်မယ်` : `🎯 Activity-trigger 🟢 ဖွင့်မယ်`, `a:${id}:trgtog`), btn("🔢 Threshold", `a:${id}:trgth`)]);
   rows.push([btn("🔄 Reconnect", `a:${id}:rc`), btn("🔑 Session ကြည့်", `a:${id}:sess`)]);
   rows.push([btn("🗑 Account ဖျက်", `a:${id}:del`)]);
   rows.push([btn("⬅️ Accounts", "accs")]);
@@ -687,6 +768,19 @@ async function accRoute(ctx, [id, action, arg]) {
         `🔑 [${acc.name}] Session String (backup/ရွှေ့ဖို့)\n\n<code>${acc.sessionString}</code>\n\n⚠️ ဒါက password လိုပဲ — copy ပြီးရင် ဒီ message ကို ဖျက်ပါ`,
         { parse_mode: "HTML", reply_markup: { inline_keyboard: back } }
       );
+
+    case "trgtog": {
+      const on = !acc.triggerOn;
+      await saveAccount(acc.name, { triggerOn: on });
+      if (on) await buildTriggerChats(acc.name);
+      const fresh = await getAccById(id);
+      return showAccount(ctx, fresh, on
+        ? `🎯 Activity-trigger ဖွင့်ပြီး — ဒီ account ရဲ့ GP ${(acc.gpLinks || []).length} ခုထဲက အခြား user တွေ message ${acc.triggerThreshold || triggerThreshold} ကြိမ်ပို့ရင် auto ပို့မယ်`
+        : "🎯 Activity-trigger ပိတ်ပြီး");
+    }
+    case "trgth":
+      setAwait("trg_th", { accId: id });
+      return render(ctx, `🔢 [${acc.name}] Activity-trigger threshold ရိုက်ပို့ပါ\n\nအခြား user (ကိုယ့် account မဟုတ်) တွေ GP ထဲမှာ message ဒီအကြိမ်ရေ ပို့ရင် auto ပို့မယ် (လက်ရှိ: ${acc.triggerThreshold || triggerThreshold})`, cancelRows);
 
     case "rc":
       try {
@@ -861,11 +955,13 @@ function showSettings(ctx, note) {
   t += `\n🎲 Random delay: ${jitter ? "🟢 ON (delay ±25% ပြောင်း — ပိုသဘာဝကျ)" : "🔴 OFF"}`;
   t += `\n⏰ Interval : ${fmtMin(intervalMinutes)} (Scheduler မှာ ပြောင်းပါ)`;
   t += `\n🌙 Quiet hours: ${quietText()}\n   (ဒီအချိန်တွင်း Scheduler က မပို့ဘူး — manual send ကတော့ ရ)`;
+  t += `\n🎯 Activity-trigger default: ${triggerThreshold} ကြိမ် (Accounts > account > 🎯 မှာ account တစ်ခုချင်းစီ ဖွင့်/ပိတ်ပါ)`;
   return render(ctx, t, [
     [btn("3s", "set:dly:3"), btn("6s", "set:dly:6"), btn("10s", "set:dly:10"), btn("15s", "set:dly:15"), btn("30s", "set:dly:30")],
     [btn("✏️ Delay ကိုယ်တိုင်ရိုက်", "set:dlyc"), btn(jitter ? "🎲 Random ပိတ်" : "🎲 Random ဖွင့်", "set:jit")],
     [btn("🌙 Quiet ပိတ်", "set:q:off"), btn("23-07", "set:q:23-7"), btn("00-06", "set:q:0-6")],
     [btn("✏️ Quiet hours ကိုယ်တိုင် (ဥပမာ 22-6)", "set:qc")],
+    [btn("🔢 Activity-trigger default ပြောင်း", "set:trgth")],
     [btn("⏰ Scheduler သို့", "sch")],
     [btn("🏠 Home", "home")],
   ]);
@@ -1017,6 +1113,7 @@ async function route(ctx, p) {
       }
       if (a === "qc") { setAwait("quiet_custom"); return render(ctx, "✏️ Quiet hours ရိုက်ပို့ပါ (မြန်မာစံတော်ချိန်, 24 နာရီ)\nပုံစံ: စ-ဆုံး  ဥပမာ 23-7 (ည ၁၁ နာရီ ကနေ မနက် ၇ နာရီ)", cancelRows); }
       if (a === "dlyc") { setAwait("dly_custom"); return render(ctx, "✏️ Delay စက္ကန့် ရိုက်ပို့ပါ (ဥပမာ 8)", cancelRows); }
+      if (a === "trgth") { setAwait("trg_def_th"); return render(ctx, `✏️ Activity-trigger default threshold ရိုက်ပို့ပါ (ဥပမာ 4)\n\nAccount တစ်ခုချင်းစီက threshold သီးသန့်မသတ်မှတ်ထားရင် ဒီတန်ဖိုးကို သုံးမယ်`, cancelRows); }
       return showSettings(ctx);
 
     case "stat": return showStatus(ctx);
@@ -1172,6 +1269,26 @@ bot.on("text", adminOnly, async (ctx) => {
       return showSettings(ctx, `🌙 Quiet hours ${quietText()}`);
     }
 
+    case "trg_th": {
+      const n = parseInt(raw);
+      if (!n || n < 1) return ctx.reply("⚠️ နံပါတ်ရိုက်ပါ (ဥပမာ 4)");
+      awaiting = null;
+      const acc = await getAccById(a.accId);
+      if (!acc) return showAccounts(ctx, "❌ Account မတွေ့ပါ");
+      await saveAccount(acc.name, { triggerThreshold: n });
+      const fresh = await getAccById(a.accId);
+      return showAccount(ctx, fresh, `🔢 Threshold ${n} ကြိမ် သတ်မှတ်ပြီး`);
+    }
+
+    case "trg_def_th": {
+      const n = parseInt(raw);
+      if (!n || n < 1) return ctx.reply("⚠️ နံပါတ်ရိုက်ပါ (ဥပမာ 4)");
+      awaiting = null;
+      triggerThreshold = n;
+      await saveSettings({ triggerThreshold });
+      return showSettings(ctx, `🔢 Default threshold ${n} ကြိမ် သတ်မှတ်ပြီး`);
+    }
+
     case "dly_custom": {
       const n = parseInt(raw);
       if (!n || n < 1) return ctx.reply("⚠️ နံပါတ်ရိုက်ပါ (ဥပမာ 8)");
@@ -1223,6 +1340,7 @@ async function main() {
   if (s.sendDelaySeconds) sendDelaySeconds = s.sendDelaySeconds;
   if (typeof s.jitter === "boolean") jitter = s.jitter;
   if (typeof s.quietStart === "number" && typeof s.quietEnd === "number") { quietStart = s.quietStart; quietEnd = s.quietEnd; }
+  if (s.triggerThreshold) triggerThreshold = s.triggerThreshold;
 
   await initAllClients();
   if (s.schedulerOn && intervalMinutes > 0) startScheduler();
