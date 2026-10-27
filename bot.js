@@ -1,6 +1,6 @@
 require("dotenv").config();
 const { Telegraf } = require("telegraf");
-const { TelegramClient } = require("telegram");
+const { TelegramClient, utils } = require("telegram");
 const { StringSession } = require("telegram/sessions");
 const { Api } = require("telegram/tl");
 const { NewMessage } = require("telegram/events");
@@ -298,7 +298,10 @@ async function buildTriggerChats(accName) {
     for (const link of acc.gpLinks || []) {
       try {
         const entity = await resolveEntity(accName, client, link);
-        map.set(entity.id.toString(), link);
+        // entity.id က "raw" id ပါ (unmarked) — incoming message.chatId ကတော့ "marked" id
+        // (channel ဆို -100... ပုံစံ) ဖြစ်နေလို့ ဒီနှစ်ခု တိုက်ရိုက်မတူပါ။ utils.getPeerId
+        // နဲ့ mark ပြီးမှ compare လုပ်ရမယ် — မဟုတ်ရင် GP ကို message ဝင်နေပေမယ့် match လုပ်မရတော့ဘူး
+        map.set(utils.getPeerId(entity).toString(), link);
       } catch (_) {} // join မလုပ်ရသေးတဲ့ GP ကျော်
     }
   }
