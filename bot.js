@@ -341,6 +341,7 @@ async function handleIncomingMessage(accName, event) {
   if (!msg || msg.out) return; // ကိုယ်တိုင်ပို့တဲ့ message
   const acc = await getAccount(accName);
   if (!acc || !acc.triggerOn) return;
+  if (acc.paused) return; // ⏸ Pause ထားရင် activity-trigger လည်း လုံးဝမပို့ (count လည်းမထည့်)
 
   let chatId;
   try { chatId = msg.chatId?.toString(); } catch (_) { chatId = null; }
@@ -397,11 +398,12 @@ async function handleIncomingMessage(accName, event) {
     if (locked) return; // scheduler/manual send ဒီ GP ကို အတူတူပို့နေလို့ ကျော်လိုက်မယ် (counter ဆက်ထားမယ်၊ နောက် message ကျရင် ပြန်စစ်မယ်)
     triggerCounts[key] = 0;
     await incStats(accName, 1, 0);
-    notify(`🎯 [${accName}] Activity trigger — အခြား user ${threshold} ကြိမ် post ပြီးလို့ auto ပို့ပြီး\n${short(link, 50)}`).catch(() => {});
+    if (!acc.triggerSilent) notify(`🎯 [${accName}] Activity trigger — အခြား user ${threshold} ကြိမ် post ပြီးလို့ auto ပို့ပြီး\n${short(link, 50)}`).catch(() => {});
   } catch (e) {
     triggerCounts[key] = 0;
     await incStats(accName, 0, 1);
-    notify(`🎯 [${accName}] Activity trigger ပို့လို့မရ — ${short(e.message || "error", 80)}\n${short(link, 50)}`).catch(() => {});
+    console.error(`trigger[${accName}]: ပို့လို့မရ — ${e.message}`);
+    if (!acc.triggerSilent) notify(`🎯 [${accName}] Activity trigger ပို့လို့မရ — ${short(e.message || "error", 80)}\n${short(link, 50)}`).catch(() => {});
   }
 }
 
@@ -720,6 +722,7 @@ async function showAccount(ctx, acc, note) {
   rows.push([btn(acc.paused ? "▶️ ပြန်စ (Resume)" : "⏸ ခဏရပ် (Pause)", `a:${id}:pause`), btn("🧪 Test (Saved Msg)", `a:${id}:test`)]);
   rows.push([btn("👁 Profile ကြည့်", `a:${id}:prof`), btn("📂 ဝင်ပြီးသား GP များ", `a:${id}:dlg`)]);
   rows.push([btn(acc.triggerOn ? `🎯 Activity-trigger ⚪ ပိတ်မယ်` : `🎯 Activity-trigger 🟢 ဖွင့်မယ်`, `a:${id}:trgtog`)]);
+  rows.push([btn(acc.triggerSilent ? "🔕 Trigger Noti ⚪ ပိတ်ထား (ဖွင့်မယ်)" : "🔔 Trigger Noti 🟢 ဖွင့်ထား (ပိတ်မယ်)", `a:${id}:trgsil`)]);
   rows.push([btn("🔢 Threshold", `a:${id}:trgth`), btn("⏱ Cooldown", `a:${id}:trgcd`)]);
   rows.push([btn("🔄 Reconnect", `a:${id}:rc`), btn("🔑 Session ကြည့်", `a:${id}:sess`)]);
   rows.push([btn("🗑 Account ဖျက်", `a:${id}:del`)]);
@@ -845,6 +848,13 @@ async function accRoute(ctx, [id, action, arg]) {
         `🔑 [${acc.name}] Session String (backup/ရွှေ့ဖို့)\n\n<code>${acc.sessionString}</code>\n\n⚠️ ဒါက password လိုပဲ — copy ပြီးရင် ဒီ message ကို ဖျက်ပါ`,
         { parse_mode: "HTML", reply_markup: { inline_keyboard: back } }
       );
+
+    case "trgsil": {
+      const silent = !acc.triggerSilent;
+      await saveAccount(acc.name, { triggerSilent: silent });
+      const fresh = await getAccById(id);
+      return showAccount(ctx, fresh, silent ? "🔕 Trigger notification ပိတ်ပြီး — auto ပို့ပေမယ့် bot က message မပို့တော့ဘူး" : "🔔 Trigger notification ပြန်ဖွင့်ပြီး");
+    }
 
     case "trgtog": {
       const on = !acc.triggerOn;
