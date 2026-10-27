@@ -64,7 +64,14 @@ const saveSettings = (data) => db.collection("settings").updateOne({ _id: "main"
 const getAccounts = () => db.collection("accounts").find({}).sort({ order: 1, addedAt: 1 }).toArray();
 const getAccount = (name) => db.collection("accounts").findOne({ name });
 const getAccById = async (id) => (ObjectId.isValid(id) ? db.collection("accounts").findOne({ _id: new ObjectId(id) }) : null);
-const saveAccount = (name, data) => db.collection("accounts").updateOne({ name }, { $set: data }, { upsert: true });
+const saveAccount = async (name, data) => {
+  const r = await db.collection("accounts").updateOne({ name }, { $set: data }, { upsert: true });
+  if (data && "gpLinks" in data) { // GP list ပြောင်းရင် trigger monitor list ကို ချက်ချင်း refresh
+    delete triggerChats[name];
+    if (clientPool[name]) buildTriggerChats(name).catch(() => {});
+  }
+  return r;
+};
 async function deleteAccount(name) {
   await db.collection("accounts").deleteOne({ name });
   await db.collection("sendlogs").deleteMany({ accName: name });
@@ -252,13 +259,19 @@ function startHealthCheck() {
     for (const acc of await getAccounts()) {
       const client = clientPool[acc.name];
       if (!client) continue; // disconnected ဖြစ်နေရင် manual Reconnect လိုအပ်သည် (auto မလုပ်ဘူး — crash loop ကာကွယ်ရန်)
-      if (!client.connected) {
-        console.log(`healthcheck[${acc.name}]: connected=false တွေ့ — auto-reconnect လုပ်နေသည်`);
+      // connected=true ပုံပေါ်ပေမယ့် တကယ်ဆက်သွယ်မှု သေနေတာ (TIMEOUT) ကို စစ်ဖို့ getMe ကို တကယ်ပို့ကြည့် (၂၀ စက္ကန့်)
+      let alive = !!client.connected;
+      if (alive) {
+        try { await Promise.race([client.getMe(), new Promise((_, rej) => setTimeout(() => rej(new Error("PING_TIMEOUT")), 20000))]); }
+        catch (e) { alive = false; console.log(`healthcheck[${acc.name}]: ping မအောင်မြင် (${e.message})`); }
+      }
+      if (!alive) {
+        console.log(`healthcheck[${acc.name}]: ချိတ်ဆက်မှုပျက် — auto-reconnect လုပ်နေသည်`);
         try { await reconnectAccount(acc); console.log(`healthcheck[${acc.name}]: reconnect အောင်မြင်ပြီး`); }
         catch (e) { console.error(`healthcheck[${acc.name}]: reconnect မအောင်မြင် — ${e.message}`); delete clientPool[acc.name]; }
       }
     }
-  }, 5 * 60 * 1000); // ၅ မိနစ်တစ်ခါ
+  }, 2 * 60 * 1000); // ၂ မိနစ်တစ်ခါ
 }
 
 async function reconnectAccount(acc) {
@@ -315,6 +328,7 @@ async function withGpLock(key, fn) {
 }
 
 // ပို့လို့ မရနိုင်တော့တဲ့ (အမြဲတမ်းလိုလို) error များ — ဒီ account က ဒီ GP မှာ ban/kick/write မရတော့
+const lastRebuild = {};
 const trgFailCounts = {}; // `${accName}|${link}` → ဆက်တိုက် permanent-error အကြိမ်ရေ
 const isPermanentSendError = (e) => /USER_BANNED_IN_CHANNEL|CHAT_WRITE_FORBIDDEN|CHANNEL_PRIVATE|USER_KICKED|CHAT_SEND_PLAIN_FORBIDDEN|CHAT_RESTRICTED|CHANNEL_INVALID|CHAT_ID_INVALID|PEER_ID_INVALID|USER_NOT_PARTICIPANT|CHAT_ADMIN_REQUIRED|CHAT_GUEST_SEND_FORBIDDEN|YOU_BLOCKED_USER/.test(e?.message || "");
 
@@ -357,7 +371,8 @@ async function handleIncomingMessage(accName, event) {
 
   if (!triggerChats[accName]) await buildTriggerChats(accName);
   let link = triggerChats[accName]?.get(chatId);
-  if (!link) { // GP list အသစ်ဖြစ်နိုင်လို့ တစ်ခါ ပြန် rebuild
+  if (!link && Date.now() - (lastRebuild[accName] || 0) > 60000) { // GP list အသစ်ဖြစ်နိုင်လို့ rebuild (၁ မိနစ်တစ်ခါထက် မများ)
+    lastRebuild[accName] = Date.now();
     await buildTriggerChats(accName);
     link = triggerChats[accName]?.get(chatId);
   }
