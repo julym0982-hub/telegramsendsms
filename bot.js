@@ -404,7 +404,7 @@ async function sendAllAccounts({ force = false, onlyName = null, source = "manua
   if (isSending) { await notify("⚠️ ပို့နေဆဲ ရှိသေးသည်။ ခဏစောင့်ပါ။"); return; }
   isSending = true;
   stopSend = false;
-  const title = source === "scheduler" ? "⏰ Auto send (scheduler)" : force ? "⚡ Force send" : "📤 Send (cooldown စစ်)";
+  const title = source === "scheduler" ? "⏰ Auto send (scheduler)" : force ? "⚡ Force send" : "📤 Send (Scheduler/Manual Interval စစ် — Activity-trigger မဟုတ်)";
   const prog = new Progress(title, "stop:send");
   let ok = 0, fail = 0, skip = 0, stopped = false;
   const dead = {};
@@ -662,6 +662,7 @@ async function showAccount(ctx, acc, note) {
   t += `\n💬 Message: ${acc.customMsg ? "custom (ဒီ account သီးသန့်)" : globalMsg ? "global သုံးနေ" : "⚠️ မသတ်မှတ်ရသေး"}`;
   t += `\n🔗 GP: ${gps.length} ခု`;
   t += `\n🎯 Activity-trigger: ${acc.triggerOn ? `🟢 ဖွင့်ထား — ${acc.triggerThreshold || triggerThreshold} ကြိမ်တိုင်း · cooldown ${fmtCd(acc.triggerCooldownMin ?? triggerCooldownDefault)}` : "⚪ ပိတ်ထား"}`;
+  t += `\n\n📤 Scheduler/Manual Send interval (${fmtMin(intervalMinutes)}) — Activity-trigger နဲ့ မဆိုင်ပါ:`;
   for (let i = 0; i < gps.length && i < 40; i++) {
     const last = await getLastSent(acc.name, gps[i]);
     const rem = last ? Math.ceil(intervalMinutes - (Date.now() - new Date(last).getTime()) / 60000) : 0;
