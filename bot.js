@@ -40,9 +40,11 @@ let quietStart       = null;  // 🌙 Quiet hours (မြန်မာစံတ�
 let quietEnd         = null;
 let lastFailed       = {};    // accName → [dead GP links] (နောက်ဆုံး send က)
 let triggerThreshold = 4;     // 🎯 default: အခြား user က message ဒီအကြိမ်ရေ ပို့ရင် auto-trigger
+let triggerCooldownDefault = 2; // 🎯 default: trigger ပို့ပြီးရင် GP တစ်ခုအတွက် ဒီမိနစ်အထိ ထပ်မပို့ဘူး (scheduler interval နဲ့ မဆိုင်၊ သီးသန့်)
 const triggerCounts  = {};    // `${accName}|${chatId}` → count (memory ထဲပဲ)
 const triggerChats   = {};    // accName → Map(chatId → gpLink) — ဒီ account က monitor လုပ်မယ့် GP တွေ
 const ownIds         = new Set(); // ကိုယ့် account တွေရဲ့ Telegram user id (အချင်းချင်း count မထည့်ဖို့)
+const sendLocks       = new Set(); // `${accName}|${link}` — GP တစ်ခုတည်းကို တစ်ချိန်တည်း (scheduler/manual/trigger) ထပ်ကြိမ်မပို့အောင် lock
 
 const bot = new Telegraf(BOT_TOKEN);
 
@@ -124,6 +126,7 @@ const clip = (t, n = 3900) => (t.length > n ? t.slice(0, n - 20) + "\n…(ဆက
 const short = (s, n = 34) => (s.length > n ? s.slice(0, n) + "…" : s);
 const btn = (text, data) => ({ text, callback_data: data });
 const fmtMin = (m) => (m >= 60 ? (m % 60 === 0 ? `${m / 60} နာရီ` : `${(m / 60).toFixed(1)} နာရီ`) : `${m} မိနစ်`);
+const fmtCd = (m) => (m > 0 ? `${m} မိနစ်` : "ပိတ်ထား (cooldown မရှိ)");
 
 function parseDuration(s) {
   const t = s.trim().toLowerCase();
@@ -276,6 +279,14 @@ async function sendToGroup(accName, client, link, message) {
 
 const isDeadSession = (e) => /AUTH_KEY|SESSION_REVOKED|SESSION_EXPIRED|USER_DEACTIVATED/.test(e.message || "");
 
+// GP တစ်ခုတည်းကို scheduler/manual send နဲ့ activity-trigger က တစ်ချိန်တည်း ထပ်ကြိမ် မပို့မိအောင် lock
+async function withGpLock(key, fn) {
+  if (sendLocks.has(key)) return { locked: true };
+  sendLocks.add(key);
+  try { return { locked: false, result: await fn() }; }
+  finally { sendLocks.delete(key); }
+}
+
 // ─── 🎯 ACTIVITY AUTO-TRIGGER ───────────────────────────────────────────────────
 // GP ထဲမှာ အခြား user (ကိုယ့် account မဟုတ်တဲ့သူ) တွေက message အကြိမ်ရေ သတ်မှတ်ထားသလောက်
 // ပို့ပြီးတဲ့အခါ၊ ရွေးထားတဲ့ account ကနေ auto ပို့ပေးတဲ့ စနစ်။ Timer scheduler နဲ့ သီးခြားစီ အလုပ်လုပ်သည်။
@@ -318,24 +329,34 @@ async function handleIncomingMessage(accName, event) {
   const key = `${accName}|${chatId}`;
   const threshold = Math.max(1, acc.triggerThreshold || triggerThreshold);
   triggerCounts[key] = (triggerCounts[key] || 0) + 1;
-  if (triggerCounts[key] < threshold) return;
-  triggerCounts[key] = 0;
+  if (triggerCounts[key] < threshold) return; // user count မပြည့်သေး
 
   const msgText = acc.customMsg || globalMsg;
   if (!msgText) return; // message မသတ်မှတ်ရသေးရင် မပို့ဘူး
 
-  // GP တစ်ခုအတွက် interval cooldown ကို scheduler/manual send နဲ့အတူ သုံးစွဲသည် (spam မဖြစ်အောင်)
-  const last = await getLastSent(accName, link);
-  if (last && (Date.now() - new Date(last).getTime()) / 60000 < intervalMinutes) return;
+  // 🎯 Activity-trigger ကိုယ်ပိုင် cooldown — scheduler/manual interval နဲ့ လုံးဝမဆိုင်၊ သီးသန့် log key (trg:link) သုံးသည်
+  // count ပြည့်ပေမယ့် cooldown မပြည့်သေးရင် counter ကို reset မလုပ်ဘဲ ဆက်စောင့်မယ် (message အသစ်ဝင်တိုင်း ပြန်စစ်မယ်)
+  const trgLogKey = `trg:${link}`;
+  const cdMin = acc.triggerCooldownMin ?? triggerCooldownDefault;
+  if (cdMin > 0) {
+    const lastT = await getLastSent(accName, trgLogKey);
+    if (lastT && (Date.now() - new Date(lastT).getTime()) / 60000 < cdMin) return; // cooldown ပြည့်အောင်စောင့်
+  }
 
   const client = clientPool[accName];
   if (!client) return;
+  const lockKey = `${accName}|${link}`;
   try {
-    await sendToGroup(accName, client, link, pickSpun(msgText));
-    await updateLastSent(accName, link);
+    const { locked } = await withGpLock(lockKey, async () => {
+      await sendToGroup(accName, client, link, pickSpun(msgText));
+      await updateLastSent(accName, trgLogKey);
+    });
+    if (locked) return; // scheduler/manual send ဒီ GP ကို အတူတူပို့နေလို့ ကျော်လိုက်မယ် (counter ဆက်ထားမယ်၊ နောက် message ကျရင် ပြန်စစ်မယ်)
+    triggerCounts[key] = 0;
     await incStats(accName, 1, 0);
     notify(`🎯 [${accName}] Activity trigger — အခြား user ${threshold} ကြိမ် post ပြီးလို့ auto ပို့ပြီး\n${short(link, 50)}`).catch(() => {});
   } catch (e) {
+    triggerCounts[key] = 0;
     await incStats(accName, 0, 1);
     notify(`🎯 [${accName}] Activity trigger ပို့လို့မရ — ${short(e.message || "error", 80)}\n${short(link, 50)}`).catch(() => {});
   }
@@ -421,8 +442,15 @@ async function sendAllAccounts({ force = false, onlyName = null, source = "manua
         }
         attempted = true;
         try {
-          await sendToGroup(acc.name, client, link, pickSpun(msg));
-          await updateLastSent(acc.name, link);
+          const { locked } = await withGpLock(`${acc.name}|${link}`, async () => {
+            await sendToGroup(acc.name, client, link, pickSpun(msg));
+            await updateLastSent(acc.name, link);
+          });
+          if (locked) { // 🎯 activity-trigger ဒီ GP ကို အတူတူပို့နေလို့ ဒီအလှည့်ကျော်မယ်
+            aSkip++;
+            await prog.add(`⏭ #${i + 1} [${acc.name}] trigger ပို့နေဆဲ — ကျော်`);
+            continue;
+          }
           aOk++;
           await prog.add(`✅ #${i + 1} [${acc.name}]`);
         } catch (err) {
@@ -626,7 +654,7 @@ async function showAccount(ctx, acc, note) {
   if (note) t += `\n${note}\n`;
   t += `\n💬 Message: ${acc.customMsg ? "custom (ဒီ account သီးသန့်)" : globalMsg ? "global သုံးနေ" : "⚠️ မသတ်မှတ်ရသေး"}`;
   t += `\n🔗 GP: ${gps.length} ခု`;
-  t += `\n🎯 Activity-trigger: ${acc.triggerOn ? `🟢 ဖွင့်ထား (${acc.triggerThreshold || triggerThreshold} ကြိမ်)` : "⚪ ပိတ်ထား"}`;
+  t += `\n🎯 Activity-trigger: ${acc.triggerOn ? `🟢 ဖွင့်ထား — ${acc.triggerThreshold || triggerThreshold} ကြိမ်တိုင်း · cooldown ${fmtCd(acc.triggerCooldownMin ?? triggerCooldownDefault)}` : "⚪ ပိတ်ထား"}`;
   for (let i = 0; i < gps.length && i < 40; i++) {
     const last = await getLastSent(acc.name, gps[i]);
     const rem = last ? Math.ceil(intervalMinutes - (Date.now() - new Date(last).getTime()) / 60000) : 0;
@@ -643,7 +671,8 @@ async function showAccount(ctx, acc, note) {
   rows.push([btn("🤝 Join", `a:${id}:join`), btn("📤 ဒီ account ပို့", `a:${id}:send`)]);
   rows.push([btn(acc.paused ? "▶️ ပြန်စ (Resume)" : "⏸ ခဏရပ် (Pause)", `a:${id}:pause`), btn("🧪 Test (Saved Msg)", `a:${id}:test`)]);
   rows.push([btn("👁 Profile ကြည့်", `a:${id}:prof`), btn("📂 ဝင်ပြီးသား GP များ", `a:${id}:dlg`)]);
-  rows.push([btn(acc.triggerOn ? `🎯 Activity-trigger ⚪ ပိတ်မယ်` : `🎯 Activity-trigger 🟢 ဖွင့်မယ်`, `a:${id}:trgtog`), btn("🔢 Threshold", `a:${id}:trgth`)]);
+  rows.push([btn(acc.triggerOn ? `🎯 Activity-trigger ⚪ ပိတ်မယ်` : `🎯 Activity-trigger 🟢 ဖွင့်မယ်`, `a:${id}:trgtog`)]);
+  rows.push([btn("🔢 Threshold", `a:${id}:trgth`), btn("⏱ Cooldown", `a:${id}:trgcd`)]);
   rows.push([btn("🔄 Reconnect", `a:${id}:rc`), btn("🔑 Session ကြည့်", `a:${id}:sess`)]);
   rows.push([btn("🗑 Account ဖျက်", `a:${id}:del`)]);
   rows.push([btn("⬅️ Accounts", "accs")]);
@@ -779,8 +808,40 @@ async function accRoute(ctx, [id, action, arg]) {
         : "🎯 Activity-trigger ပိတ်ပြီး");
     }
     case "trgth":
+      return render(ctx, `🔢 [${acc.name}] Activity-trigger Threshold\n\nအခြား user (ကိုယ့် account မဟုတ်) တွေ GP ထဲမှာ message ဒီအကြိမ်ရေ ပို့တိုင်း auto ပို့မယ် (လက်ရှိ: ${acc.triggerThreshold || triggerThreshold} ကြိမ်)`, [
+        [btn("2", `a:${id}:trgths:2`), btn("3", `a:${id}:trgths:3`), btn("4", `a:${id}:trgths:4`)],
+        [btn("5", `a:${id}:trgths:5`), btn("6", `a:${id}:trgths:6`), btn("8", `a:${id}:trgths:8`)],
+        [btn("10", `a:${id}:trgths:10`), btn("✏️ ကိုယ်တိုင်ရိုက်", `a:${id}:trgthc`)],
+        back[0],
+      ]);
+    case "trgths": {
+      const n = parseInt(arg);
+      if (!n || n < 1) return showAccount(ctx, acc);
+      await saveAccount(acc.name, { triggerThreshold: n });
+      const fresh = await getAccById(id);
+      return showAccount(ctx, fresh, `🔢 Threshold ${n} ကြိမ် သတ်မှတ်ပြီး`);
+    }
+    case "trgthc":
       setAwait("trg_th", { accId: id });
-      return render(ctx, `🔢 [${acc.name}] Activity-trigger threshold ရိုက်ပို့ပါ\n\nအခြား user (ကိုယ့် account မဟုတ်) တွေ GP ထဲမှာ message ဒီအကြိမ်ရေ ပို့ရင် auto ပို့မယ် (လက်ရှိ: ${acc.triggerThreshold || triggerThreshold})`, cancelRows);
+      return render(ctx, `✏️ [${acc.name}] Threshold ကိုယ်တိုင်ရိုက်ထည့်ပါ (ဥပမာ 7)`, cancelRows);
+
+    case "trgcd":
+      return render(ctx, `⏱ [${acc.name}] Activity-trigger Cooldown\n\nAuto ပို့ပြီးတဲ့ GP တစ်ခုကို ဒီမိနစ်အထိ ထပ်မပို့ဘူး (threshold ပြည့်နေရင်တောင် cooldown စောင့်ရမယ်)\nScheduler Interval နဲ့ မဆိုင်ပါ — သီးသန့်ပါ\n(လက်ရှိ: ${fmtCd(acc.triggerCooldownMin ?? triggerCooldownDefault)})`, [
+        [btn("ပိတ် (0)", `a:${id}:trgcds:0`), btn("1မိ", `a:${id}:trgcds:1`), btn("2မိ", `a:${id}:trgcds:2`)],
+        [btn("3မိ", `a:${id}:trgcds:3`), btn("5မိ", `a:${id}:trgcds:5`), btn("10မိ", `a:${id}:trgcds:10`)],
+        [btn("✏️ ကိုယ်တိုင်ရိုက်", `a:${id}:trgcdc`)],
+        back[0],
+      ]);
+    case "trgcds": {
+      const n = parseInt(arg);
+      if (n == null || isNaN(n) || n < 0) return showAccount(ctx, acc);
+      await saveAccount(acc.name, { triggerCooldownMin: n });
+      const fresh = await getAccById(id);
+      return showAccount(ctx, fresh, `⏱ Cooldown ${fmtCd(n)} သတ်မှတ်ပြီး`);
+    }
+    case "trgcdc":
+      setAwait("trg_cd", { accId: id });
+      return render(ctx, `✏️ [${acc.name}] Cooldown မိနစ် ကိုယ်တိုင်ရိုက်ထည့်ပါ (ဥပမာ 4, ပိတ်ချင်ရင် 0)`, cancelRows);
 
     case "rc":
       try {
@@ -955,13 +1016,14 @@ function showSettings(ctx, note) {
   t += `\n🎲 Random delay: ${jitter ? "🟢 ON (delay ±25% ပြောင်း — ပိုသဘာဝကျ)" : "🔴 OFF"}`;
   t += `\n⏰ Interval : ${fmtMin(intervalMinutes)} (Scheduler မှာ ပြောင်းပါ)`;
   t += `\n🌙 Quiet hours: ${quietText()}\n   (ဒီအချိန်တွင်း Scheduler က မပို့ဘူး — manual send ကတော့ ရ)`;
-  t += `\n🎯 Activity-trigger default: ${triggerThreshold} ကြိမ် (Accounts > account > 🎯 မှာ account တစ်ခုချင်းစီ ဖွင့်/ပိတ်ပါ)`;
+  t += `\n🎯 Activity-trigger default: ${triggerThreshold} ကြိမ် · cooldown ${fmtCd(triggerCooldownDefault)}`;
+  t += `\n   (Accounts > account > 🎯 မှာ account တစ်ခုချင်းစီ ဖွင့်/ပိတ်/ပြင်ပါ)`;
   return render(ctx, t, [
     [btn("3s", "set:dly:3"), btn("6s", "set:dly:6"), btn("10s", "set:dly:10"), btn("15s", "set:dly:15"), btn("30s", "set:dly:30")],
     [btn("✏️ Delay ကိုယ်တိုင်ရိုက်", "set:dlyc"), btn(jitter ? "🎲 Random ပိတ်" : "🎲 Random ဖွင့်", "set:jit")],
     [btn("🌙 Quiet ပိတ်", "set:q:off"), btn("23-07", "set:q:23-7"), btn("00-06", "set:q:0-6")],
     [btn("✏️ Quiet hours ကိုယ်တိုင် (ဥပမာ 22-6)", "set:qc")],
-    [btn("🔢 Activity-trigger default ပြောင်း", "set:trgth")],
+    [btn("🔢 Threshold default", "set:trgth"), btn("⏱ Cooldown default", "set:trgcd")],
     [btn("⏰ Scheduler သို့", "sch")],
     [btn("🏠 Home", "home")],
   ]);
@@ -1114,6 +1176,7 @@ async function route(ctx, p) {
       if (a === "qc") { setAwait("quiet_custom"); return render(ctx, "✏️ Quiet hours ရိုက်ပို့ပါ (မြန်မာစံတော်ချိန်, 24 နာရီ)\nပုံစံ: စ-ဆုံး  ဥပမာ 23-7 (ည ၁၁ နာရီ ကနေ မနက် ၇ နာရီ)", cancelRows); }
       if (a === "dlyc") { setAwait("dly_custom"); return render(ctx, "✏️ Delay စက္ကန့် ရိုက်ပို့ပါ (ဥပမာ 8)", cancelRows); }
       if (a === "trgth") { setAwait("trg_def_th"); return render(ctx, `✏️ Activity-trigger default threshold ရိုက်ပို့ပါ (ဥပမာ 4)\n\nAccount တစ်ခုချင်းစီက threshold သီးသန့်မသတ်မှတ်ထားရင် ဒီတန်ဖိုးကို သုံးမယ်`, cancelRows); }
+      if (a === "trgcd") { setAwait("trg_def_cd"); return render(ctx, `✏️ Activity-trigger default cooldown မိနစ် ရိုက်ပို့ပါ (ဥပမာ 2, ပိတ်ချင်ရင် 0)\n\nAccount တစ်ခုချင်းစီက cooldown သီးသန့်မသတ်မှတ်ထားရင် ဒီတန်ဖိုးကို သုံးမယ်`, cancelRows); }
       return showSettings(ctx);
 
     case "stat": return showStatus(ctx);
@@ -1289,6 +1352,26 @@ bot.on("text", adminOnly, async (ctx) => {
       return showSettings(ctx, `🔢 Default threshold ${n} ကြိမ် သတ်မှတ်ပြီး`);
     }
 
+    case "trg_cd": {
+      const n = parseInt(raw);
+      if (isNaN(n) || n < 0) return ctx.reply("⚠️ နံပါတ်ရိုက်ပါ (ဥပမာ 4, ပိတ်ချင်ရင် 0)");
+      awaiting = null;
+      const acc = await getAccById(a.accId);
+      if (!acc) return showAccounts(ctx, "❌ Account မတွေ့ပါ");
+      await saveAccount(acc.name, { triggerCooldownMin: n });
+      const fresh = await getAccById(a.accId);
+      return showAccount(ctx, fresh, `⏱ Cooldown ${fmtCd(n)} သတ်မှတ်ပြီး`);
+    }
+
+    case "trg_def_cd": {
+      const n = parseInt(raw);
+      if (isNaN(n) || n < 0) return ctx.reply("⚠️ နံပါတ်ရိုက်ပါ (ဥပမာ 4, ပိတ်ချင်ရင် 0)");
+      awaiting = null;
+      triggerCooldownDefault = n;
+      await saveSettings({ triggerCooldownDefault });
+      return showSettings(ctx, `⏱ Default cooldown ${fmtCd(n)} သတ်မှတ်ပြီး`);
+    }
+
     case "dly_custom": {
       const n = parseInt(raw);
       if (!n || n < 1) return ctx.reply("⚠️ နံပါတ်ရိုက်ပါ (ဥပမာ 8)");
@@ -1341,6 +1424,7 @@ async function main() {
   if (typeof s.jitter === "boolean") jitter = s.jitter;
   if (typeof s.quietStart === "number" && typeof s.quietEnd === "number") { quietStart = s.quietStart; quietEnd = s.quietEnd; }
   if (s.triggerThreshold) triggerThreshold = s.triggerThreshold;
+  if (typeof s.triggerCooldownDefault === "number") triggerCooldownDefault = s.triggerCooldownDefault;
 
   await initAllClients();
   if (s.schedulerOn && intervalMinutes > 0) startScheduler();
