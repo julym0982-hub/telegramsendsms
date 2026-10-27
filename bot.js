@@ -314,6 +314,10 @@ async function withGpLock(key, fn) {
   finally { sendLocks.delete(key); }
 }
 
+// ပို့လို့ မရနိုင်တော့တဲ့ (အမြဲတမ်းလိုလို) error များ — ဒီ account က ဒီ GP မှာ ban/kick/write မရတော့
+const trgFailCounts = {}; // `${accName}|${link}` → ဆက်တိုက် permanent-error အကြိမ်ရေ
+const isPermanentSendError = (e) => /USER_BANNED_IN_CHANNEL|CHAT_WRITE_FORBIDDEN|CHANNEL_PRIVATE|USER_KICKED|CHAT_SEND_PLAIN_FORBIDDEN|CHAT_RESTRICTED|CHANNEL_INVALID|CHAT_ID_INVALID|PEER_ID_INVALID|USER_NOT_PARTICIPANT|CHAT_ADMIN_REQUIRED|CHAT_GUEST_SEND_FORBIDDEN|YOU_BLOCKED_USER/.test(e?.message || "");
+
 // ─── 🎯 ACTIVITY AUTO-TRIGGER ───────────────────────────────────────────────────
 // GP ထဲမှာ အခြား user (ကိုယ့် account မဟုတ်တဲ့သူ) တွေက message အကြိမ်ရေ သတ်မှတ်ထားသလောက်
 // ပို့ပြီးတဲ့အခါ၊ ရွေးထားတဲ့ account ကနေ auto ပို့ပေးတဲ့ စနစ်။ Timer scheduler နဲ့ သီးခြားစီ အလုပ်လုပ်သည်။
@@ -365,6 +369,8 @@ async function handleIncomingMessage(accName, event) {
     return; // ကိုယ့် account တွေချင်း count မထည့်ဘူး
   }
 
+  if ((acc.triggerBlocked || []).includes(link)) return; // ban/kick ဖြစ်ထားတဲ့ GP — count မထည့်၊ မပို့ (error မထပ်အောင်)
+
   const key = `${accName}|${chatId}`;
   const threshold = Math.max(1, acc.triggerThreshold || triggerThreshold);
   triggerCounts[key] = (triggerCounts[key] || 0) + 1;
@@ -397,13 +403,30 @@ async function handleIncomingMessage(accName, event) {
     });
     if (locked) return; // scheduler/manual send ဒီ GP ကို အတူတူပို့နေလို့ ကျော်လိုက်မယ် (counter ဆက်ထားမယ်၊ နောက် message ကျရင် ပြန်စစ်မယ်)
     triggerCounts[key] = 0;
+    trgFailCounts[`${accName}|${link}`] = 0;
     await incStats(accName, 1, 0);
     if (!acc.triggerSilent) notify(`🎯 [${accName}] Activity trigger — အခြား user ${threshold} ကြိမ် post ပြီးလို့ auto ပို့ပြီး\n${short(link, 50)}`).catch(() => {});
   } catch (e) {
     triggerCounts[key] = 0;
     await incStats(accName, 0, 1);
-    console.error(`trigger[${accName}]: ပို့လို့မရ — ${e.message}`);
-    if (!acc.triggerSilent) notify(`🎯 [${accName}] Activity trigger ပို့လို့မရ — ${short(e.message || "error", 80)}\n${short(link, 50)}`).catch(() => {});
+    console.error(`trigger[${accName}]: ${short(link, 30)} ပို့လို့မရ — ${e.message}`);
+    // ဘာကြောင့်လဲ သိရအောင် Telegram ဘက်က ဒီ account ရဲ့ GP အခြေအနေကို log ထုတ်
+    try {
+      const ent = await resolveEntity(accName, client, link);
+      const r = await client.invoke(new Api.channels.GetParticipant({ channel: ent, participant: "me" }));
+      const br = r.participant?.bannedRights;
+      console.log(`trigger[${accName}]: diag — ${r.participant?.className}${br ? ` sendMessages=${br.sendMessages} viewMessages=${br.viewMessages}` : ""}`);
+    } catch (de) { console.log(`trigger[${accName}]: diag — ${de.message}`); }
+    const fk = `${accName}|${link}`;
+    if (isPermanentSendError(e)) trgFailCounts[fk] = (trgFailCounts[fk] || 0) + 1;
+    if (isPermanentSendError(e) && trgFailCounts[fk] >= 3) {
+      // ဒီ GP ကို ဒီ account က ထပ်မစောင့်ကြည့်တော့ဘူး — ကျန် GP တွေ ပုံမှန်အတိုင်း ဆက်အလုပ်လုပ်မယ်
+      const blocked = [...new Set([...(acc.triggerBlocked || []), link])];
+      await saveAccount(accName, { triggerBlocked: blocked });
+      if (!acc.triggerSilent) notify(`🚫 [${accName}] ${short(link, 50)} ကို ပို့လို့မရတော့ဘူး (${short(e.message || "error", 60)})\n→ ဒီ GP ကို trigger စောင့်ကြည့်တာ ရပ်လိုက်ပြီ (ဆက်တိုက် ၃ ကြိမ်ပို့မရလို့)။ ပြန်ဖွင့်ချင်ရင် account menu မှာ ♻️ Blocked GP ပြန်ဖွင့်`).catch(() => {});
+    } else if (!acc.triggerSilent) {
+      notify(`🎯 [${accName}] Activity trigger ပို့လို့မရ${isPermanentSendError(e) ? ` (${trgFailCounts[fk]}/3)` : " (ယာယီ)"} — ${short(e.message || "error", 80)}\n${short(link, 50)}`).catch(() => {});
+    }
   }
 }
 
@@ -704,6 +727,7 @@ async function showAccount(ctx, acc, note) {
   t += `\n💬 Message: ${acc.customMsg ? "custom (ဒီ account သီးသန့်)" : globalMsg ? "global သုံးနေ" : "⚠️ မသတ်မှတ်ရသေး"}`;
   t += `\n🔗 GP: ${gps.length} ခု`;
   t += `\n🎯 Activity-trigger: ${acc.triggerOn ? `🟢 ဖွင့်ထား — ${acc.triggerThreshold || triggerThreshold} ကြိမ်တိုင်း · cooldown ${fmtCd(acc.triggerCooldownMin ?? triggerCooldownDefault)}` : "⚪ ပိတ်ထား"}`;
+  if ((acc.triggerBlocked || []).length) t += `\n🚫 Trigger ကျော်နေတဲ့ GP (ban/ပို့မရ): ${(acc.triggerBlocked || []).map((l) => short(l, 30)).join(", ")}`;
   t += `\n\n📤 Scheduler/Manual Send interval (${fmtMin(intervalMinutes)}) — Activity-trigger နဲ့ မဆိုင်ပါ:`;
   for (let i = 0; i < gps.length && i < 40; i++) {
     const last = await getLastSent(acc.name, gps[i]);
@@ -723,6 +747,7 @@ async function showAccount(ctx, acc, note) {
   rows.push([btn("👁 Profile ကြည့်", `a:${id}:prof`), btn("📂 ဝင်ပြီးသား GP များ", `a:${id}:dlg`)]);
   rows.push([btn(acc.triggerOn ? `🎯 Activity-trigger ⚪ ပိတ်မယ်` : `🎯 Activity-trigger 🟢 ဖွင့်မယ်`, `a:${id}:trgtog`)]);
   rows.push([btn(acc.triggerSilent ? "🔕 Trigger Noti ⚪ ပိတ်ထား (ဖွင့်မယ်)" : "🔔 Trigger Noti 🟢 ဖွင့်ထား (ပိတ်မယ်)", `a:${id}:trgsil`)]);
+  if ((acc.triggerBlocked || []).length) rows.push([btn(`♻️ Blocked GP ${(acc.triggerBlocked || []).length} ခု ပြန်ဖွင့်`, `a:${id}:trgunb`)]);
   rows.push([btn("🔢 Threshold", `a:${id}:trgth`), btn("⏱ Cooldown", `a:${id}:trgcd`)]);
   rows.push([btn("🔄 Reconnect", `a:${id}:rc`), btn("🔑 Session ကြည့်", `a:${id}:sess`)]);
   rows.push([btn("🗑 Account ဖျက်", `a:${id}:del`)]);
@@ -848,6 +873,12 @@ async function accRoute(ctx, [id, action, arg]) {
         `🔑 [${acc.name}] Session String (backup/ရွှေ့ဖို့)\n\n<code>${acc.sessionString}</code>\n\n⚠️ ဒါက password လိုပဲ — copy ပြီးရင် ဒီ message ကို ဖျက်ပါ`,
         { parse_mode: "HTML", reply_markup: { inline_keyboard: back } }
       );
+
+    case "trgunb": {
+      await saveAccount(acc.name, { triggerBlocked: [] });
+      const fresh = await getAccById(id);
+      return showAccount(ctx, fresh, "♻️ Blocked GP အကုန် ပြန်ဖွင့်ပြီး — ပို့မရရင် ထပ် auto-block ဖြစ်မယ်");
+    }
 
     case "trgsil": {
       const silent = !acc.triggerSilent;
