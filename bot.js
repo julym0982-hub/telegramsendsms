@@ -48,6 +48,10 @@ const sendLocks       = new Set(); // `${accName}|${link}` — GP တစ်ခ�
 
 const bot = new Telegraf(BOT_TOKEN);
 
+// Network blip (TIMEOUT စသည်) တွေကြောင့် process တစ်ခုလုံး မသေအောင် — log ပဲချန်ပြီး ဆက်run
+process.on("unhandledRejection", (e) => console.error("unhandledRejection:", e?.message || e));
+process.on("uncaughtException", (e) => console.error("uncaughtException:", e?.message || e));
+
 // ─── MONGODB ──────────────────────────────────────────────────────────────────
 async function connectDB() {
   const c = new MongoClient(MONGO_URI);
@@ -115,7 +119,7 @@ const incStats = (accName, ok, fail) =>
     { _id: `${todayKey()}|${accName}` },
     { $inc: { ok, fail }, $set: { day: todayKey(), accName } },
     { upsert: true }
-  ) : null;
+  ) : Promise.resolve(null); // ok=0,fail=0 (GP အကုန် skip) ဖြစ်ရင်လည်း .catch() ခေါ်နိုင်ရအောင် promise ပြန်ပေးရမယ်
 async function getTodayStats() {
   const rows = await db.collection("stats").find({ day: todayKey() }).toArray();
   const by = {}; let ok = 0, fail = 0;
